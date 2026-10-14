@@ -3,6 +3,8 @@
 // See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
 #include "strata/kernels/gdn.hpp"
+#include "strata/kernels/gdn_state.hpp"
+#include "strata/kernels/gdn_state_io.cuh"
 
 #include <cuda_runtime.h>
 
@@ -40,7 +42,8 @@ __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf
 /// `ks`/`qs` stage `k[idx[h]]` and `q[idx[h]]` for the block's heads.  Within a warp h is constant and j
 /// varies, so the staged row is read with a single broadcast - which is also why the GLOBAL loads of
 /// `q`/`k` are done once per block into shared instead of once per thread.
-__global__ void gdn_step_kernel(float* __restrict__ state, const float* __restrict__ q,
+template <typename ST>
+__global__ void gdn_step_kernel(ST* __restrict__ state, const float* __restrict__ q,
                                 const float* __restrict__ k, const float* __restrict__ v,
                                 const float* __restrict__ gate, const float* __restrict__ beta,
                                 float* __restrict__ o, int S, int h_k, int h_v) {
@@ -72,22 +75,22 @@ __global__ void gdn_step_kernel(float* __restrict__ state, const float* __restri
     for (int hi = 0; hi < nh; ++hi) {
         const int h = h0 + hi;
         const float dec = dec_s[hi], b = beta_s[hi];
-        float* col = state + (size_t) h * S + j;        // (S, h_v, S) with j fastest
+        ST* col = state + (size_t) h * S + j;           // (S, h_v, S) with j fastest
         const size_t stride = (size_t) h_v * S;
 
         // pass 1: decay the state and contract it against k.  Decay BEFORE the update - PROPERTY 5.
         float sk = 0.0f;
         for (int i = 0; i < S; ++i) {
-            const float s = col[(size_t) i * stride] * dec;
-            col[(size_t) i * stride] = s;
+            const float s = strata::kernels::gdn_st_get(col[(size_t) i * stride]) * dec;
+            strata::kernels::gdn_st_put(col[(size_t) i * stride], s);
             sk += s * ks[hi][i];
         }
         const float d = (v[(size_t) h * S + j] - sk) * b;
         // pass 2: the rank-1 update, then read out against q using the UPDATED state
         float dot = 0.0f;
         for (int i = 0; i < S; ++i) {
-            const float s = col[(size_t) i * stride] + ks[hi][i] * d;
-            col[(size_t) i * stride] = s;
+            const float s = strata::kernels::gdn_st_get(col[(size_t) i * stride]) + ks[hi][i] * d;
+            strata::kernels::gdn_st_put(col[(size_t) i * stride], s);
             dot += s * qs[hi][i];
         }
         o[(size_t) h * S + j] = dot;
@@ -150,7 +153,7 @@ __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __
 
 }  // namespace
 
-void gdn_step(float* state, const float* q, const float* k, const float* v, const float* gate,
+void gdn_step(void* state_v, const float* q, const float* k, const float* v, const float* gate,
               const float* beta, float* o, const GdnShapes& s, void* stream) {
     if (s.S <= 0 || s.h_k <= 0 || s.h_v <= 0) return;
     if (s.S > 128) {
@@ -160,8 +163,12 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
     }
     const dim3 grid((unsigned) ((s.S + JTHREADS - 1) / JTHREADS),
                     (unsigned) ((s.h_v + MAX_H - 1) / MAX_H));
-    gdn_step_kernel<<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, o, (int) s.S,
-                                                                  (int) s.h_k, (int) s.h_v);
+    if (strata::kernels::gdn_state_f16())
+        gdn_step_kernel<__half><<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(
+            (__half*) state_v, q, k, v, gate, beta, o, (int) s.S, (int) s.h_k, (int) s.h_v);
+    else
+        gdn_step_kernel<float><<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(
+            (float*) state_v, q, k, v, gate, beta, o, (int) s.S, (int) s.h_k, (int) s.h_v);
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {

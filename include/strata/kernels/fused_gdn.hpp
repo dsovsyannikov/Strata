@@ -28,7 +28,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
 void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, void* stream);
 
-void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
+void fused_gdn_step_norm(void* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream);
 

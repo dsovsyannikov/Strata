@@ -5,6 +5,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/kernels/gdn_state.hpp"
+#include "strata/kernels/gdn_state_io.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -478,7 +480,8 @@ __global__ void __launch_bounds__(S) gdn_rec_cols_warp_kernel(float* __restrict_
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
 #endif
-__global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
+template <typename ST>
+__global__ void __launch_bounds__(S * RG) gdn_rec_kernel(ST* __restrict__ state, const float* __restrict__ h,
                                                          const float* __restrict__ gate,
                                                          const float* __restrict__ beta, const float* __restrict__ z,
                                                          const float* __restrict__ gamma, float eps,
@@ -488,10 +491,10 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
     const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * S + col;
     const int qh = head % HK;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
     const size_t rs = (size_t) HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_st_get(base[r * rs]);
     const float g_col = gamma[col];
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
@@ -531,7 +534,7 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
         }
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < RPG; ++r) gdn_st_put(base[r * rs], s[r]);
 }
 
 // D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
@@ -539,7 +542,8 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 // in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
 // red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
 
-__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
+template <typename ST>
+__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(ST* __restrict__ state, const float* __restrict__ h,
                                                                 const float* __restrict__ gate,
                                                                 const float* __restrict__ beta,
                                                                 float* __restrict__ oc_out, int64_t T) {
@@ -548,10 +552,10 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
     const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
     const int qh = head % HK;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
     const size_t rs = (size_t) HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_st_get(base[r * rs]);
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
         __syncthreads();
@@ -577,7 +581,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
         if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < RPG; ++r) gdn_st_put(base[r * rs], s[r]);
 }
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
 // computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
@@ -2766,7 +2770,7 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
     } else
 #endif
     if ((serial && with_out) || T <= 0 || variant == 2) {   // the fused kernel needs z/gamma: only with the output
-        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
+        gdn_rec_kernel<float><<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
 #if !defined(__HIPCC__)
@@ -2786,35 +2790,55 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
         if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
-            gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            gdn_rec_cols_kernel<float><<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         if (with_out)
             gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     }
     check("gdn_recurrence");
 }
-void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
+static void gdn_recurrence_any(int variant, void* state, const float* h, const float* gate, const float* beta,
+                               const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                               void* stream, int64_t ld16, bool with_out) {
+    if (strata::kernels::gdn_state_f16()) {
+        // --gdn-f16: the state is half, so the serial kernels run on it directly (the arithmetic stays F32:
+        // gdn_st_get/gdn_st_put narrow at the state only).  The fused kernel's norm is inside it, so the
+        // no-output KVA form takes the cols kernel instead; upstream's chunked / tensor-core / key-head /
+        // pipelined variants are F32-state and stay on the F32 path below.
+        if (with_out)
+            gdn_rec_kernel<__half><<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+                (__half*) state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
+        else
+            gdn_rec_cols_kernel<__half><<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(
+                (__half*) state, h, gate, beta, y, T);
+        check("gdn_recurrence");
+        return;
+    }
+    gdn_recurrence_impl(variant, (float*) state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, with_out);
+}
+
+void gdn_recurrence_variant(int variant, void* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16) {
-    gdn_recurrence_impl(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, /*with_out=*/true);
+    gdn_recurrence_any(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, /*with_out=*/true);
 }
-void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
+void gdn_recurrence(void* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
     // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
     // STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
+    gdn_recurrence_any(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
 }
 /// KVA: the same recurrence, bit for bit, without the output normalisation (its readers - the output projection
 /// and the gated residual write - have no consumer when only the state advances).  `y` is still the scratch the
 /// recurrence kernels write; `z`/`gamma` are not read.
-void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
+void gdn_recurrence_state_only(void* state, const float* h, const float* gate, const float* beta, float* y,
                                int64_t T, void* stream) {
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T,
-                        stream, 0, /*with_out=*/false);
+    gdn_recurrence_any(head && !serial ? 1 : 0, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T,
+                       stream, 0, /*with_out=*/false);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
