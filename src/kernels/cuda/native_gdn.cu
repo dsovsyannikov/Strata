@@ -24,6 +24,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/gdn_state.hpp"
+#include "strata/kernels/gdn_state_io.cuh"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cmath>
@@ -43,8 +45,9 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
+template <typename ST>
 __global__ void __launch_bounds__(128, 2)
-step(float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
+step(ST* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
      const float* __restrict__ v, const float* __restrict__ gate, const float* __restrict__ beta,
      float* __restrict__ output, int h_k, int h_v, float scale) {
     const int head = blockIdx.x;
@@ -55,7 +58,7 @@ step(float* __restrict__ state, const float* __restrict__ q, const float* __rest
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         const int i = r * 32 + lane;
-        s_shard[r] = state[(size_t(i) * h_v + head) * S + col];
+        s_shard[r] = strata::kernels::gdn_st_get(state[(size_t(i) * h_v + head) * S + col]);
         k_reg[r] = k[q_head * S + i];
         q_reg[r] = q[q_head * S + i];
     }
@@ -76,7 +79,7 @@ step(float* __restrict__ state, const float* __restrict__ q, const float* __rest
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         const int i = r * 32 + lane;
-        state[(size_t(i) * h_v + head) * S + col] = s_shard[r];
+        strata::kernels::gdn_st_put(state[(size_t(i) * h_v + head) * S + col], s_shard[r]);
     }
 }
 
@@ -93,29 +96,33 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 void native_gdn_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_gdn_enabled() { return enabled.load(std::memory_order_relaxed); }
 
-void native_gdn_step(float* state, const float* q, const float* k, const float* v,
+void native_gdn_step(void* state_v, const float* q, const float* k, const float* v,
                      const float* gate, const float* beta, float* output,
                      const GdnShapes& shape, void* stream) {
     if (!stream || shape.S != S || shape.h_k <= 0 || shape.h_v <= 0 ||
         shape.h_v > 65535 || shape.h_v % shape.h_k != 0)
         throw std::invalid_argument("native GDN requires a stream, S=128 and positive divisible head counts <=65535");
-    const size_t state_bytes = size_t(S) * S * size_t(shape.h_v) * sizeof(float);
+    const size_t state_bytes = size_t(S) * S * size_t(shape.h_v) * strata::kernels::gdn_state_esize();
     const size_t qk_bytes = size_t(S) * size_t(shape.h_k) * sizeof(float);
     const size_t output_bytes = size_t(S) * size_t(shape.h_v) * sizeof(float);
     const size_t head_bytes = size_t(shape.h_v) * sizeof(float);
-    if (!valid_span(state, state_bytes) || !valid_span(output, output_bytes) ||
-        overlap(state, state_bytes, output, output_bytes))
+    if (!valid_span(state_v, state_bytes) || !valid_span(output, output_bytes) ||
+        overlap(state_v, state_bytes, output, output_bytes))
         throw std::invalid_argument("native GDN requires aligned, disjoint state and output spans");
     const void* inputs[] = {q, k, v, gate, beta};
     const size_t bytes[] = {qk_bytes, qk_bytes, output_bytes, head_bytes, head_bytes};
     for (int i = 0; i < 5; ++i) {
-        if (!valid_span(inputs[i], bytes[i]) || overlap(state, state_bytes, inputs[i], bytes[i]) ||
+        if (!valid_span(inputs[i], bytes[i]) || overlap(state_v, state_bytes, inputs[i], bytes[i]) ||
             overlap(output, output_bytes, inputs[i], bytes[i]))
             throw std::invalid_argument("native GDN requires aligned input spans disjoint from state and output");
     }
     const float scale = 1.0f / sqrtf(float(S));
-    step<<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
-        state, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v), scale);
+    if (strata::kernels::gdn_state_f16())
+        step<__half><<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
+            (__half*) state_v, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v), scale);
+    else
+        step<float><<<dim3(unsigned(shape.h_v), 1, S / 4), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
+            (float*) state_v, q, k, v, gate, beta, output, int(shape.h_k), int(shape.h_v), scale);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

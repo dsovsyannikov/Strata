@@ -1,5 +1,7 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/gdn_state.hpp"
+#include "strata/kernels/gdn_state_io.cuh"
 
 #include <cuda_runtime.h>
 
@@ -13,7 +15,8 @@ constexpr int S = 128;          // state size (rows = cols = 128)
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
+template <typename ST>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(ST* __restrict__ state, const float* __restrict__ q,
                                                                const float* __restrict__ k, const float* __restrict__ v,
                                                                const float* __restrict__ gate,
                                                                const float* __restrict__ beta,
@@ -31,10 +34,10 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     const int qh = head % h_k;
     if (tid < S) { sk[tid] = k[qh * S + tid]; sq[tid] = q[qh * S + tid]; }
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * row_stride]);
     __syncthreads();
     const float g = __expf(gate[head]);
     float kv = 0.0f;
@@ -49,7 +52,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     for (int r = 0; r < RPG; ++r) {
         s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
         o = fmaf(s[r], sq[rg * RPG + r], o);
-        base[r * row_stride] = s[r];
+        strata::kernels::gdn_st_put(base[r * row_stride], s[r]);
     }
     red_o[rg][col] = o;
     __syncthreads();
@@ -147,15 +150,19 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
+void fused_gdn_step_norm(void* state_v, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream) {
-    if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
+    if (!state_v || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
-                                                                                   gamma, eps, y, h_k, h_v);
+    if (strata::kernels::gdn_state_f16())
+        gdn_step_norm_kernel<__half><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            (__half*) state_v, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v);
+    else
+        gdn_step_norm_kernel<float><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            (float*) state_v, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));

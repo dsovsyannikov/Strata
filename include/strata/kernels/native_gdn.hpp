@@ -15,7 +15,7 @@ bool native_gdn_enabled();
 // output; both must be disjoint from each other and from every read-only input.
 // All spans must be aligned to four bytes. A nonnull ordered stream is required.
 // No allocation, wait, or change to normalization/gate preprocessing occurs.
-void native_gdn_step(float* state, const float* q, const float* k, const float* v,
+void native_gdn_step(void* state, const float* q, const float* k, const float* v,
                      const float* gate, const float* beta, float* output,
                      const GdnShapes& shapes, void* stream);
 

@@ -17,6 +17,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/gdn_state.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -2071,8 +2072,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ~KvDrain() { if (stream) cudaStreamSynchronize(stream); }
     } kv_drain{kv_prefetch ? m.kv_copy : nullptr};
     int64_t kv_prefetches = 0;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const uint64_t gdn_bytes = strata::kernels::gdn_state_layer_bytes(
+        g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels, g.ssm_d_conv);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     // layer split: a prompt of one chunk runs the stages one after the other, so the next stage's GPU idles while
     // this one reads; it streams and computes a share of this stage's experts then (set_stage_helper), in the
@@ -2609,8 +2610,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
-                    float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    void* state = (uint8_t*) ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_bytes;
+                    float* conv = (float*) ((uint8_t*) state +
+                                            strata::kernels::gdn_state_rec_bytes(g.ssm_state_size, g.ssm_v_heads));
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
@@ -4087,7 +4089,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
         std::fprintf(stderr, "; GDN state 0");
-        bad(ss.gdn_state, 64 * 1024);
+        if (strata::kernels::gdn_state_f16()) {   // widen the prefix the check reads: the stored elements are half
+            std::vector<uint16_t> raw(64 * 1024);
+            std::vector<float> wide(64 * 1024);
+            cudaMemcpy(raw.data(), ss.gdn_state, raw.size() * 2, cudaMemcpyDeviceToHost);
+            strata::kernels::gdn_state_convert_arena(wide.data(), false, raw.data(), 1, raw.size(), 0);
+            bad(wide.data(), 64 * 1024);
+        } else
+            bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -4142,11 +4151,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);
-        std::vector<uint8_t> b((size_t) gdn_floats * 4);
+        std::vector<uint8_t> b((size_t) gdn_bytes);
         std::string line;
         char h[8];
         for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
-            cudaMemcpy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size(), cudaMemcpyDeviceToHost);
+            cudaMemcpy(b.data(), (uint8_t*) ss.gdn_state + (size_t) i * gdn_bytes, b.size(), cudaMemcpyDeviceToHost);
             uint64_t x = 1469598103934665603ull;
             for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;
             std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));

@@ -82,9 +82,11 @@ struct GdnBuffers {
     uint8_t* y_q8k = nullptr;      ///< value_dim, block_q8_K
     uint8_t* y_q8_0 = nullptr;     ///< value_dim, block_q8_0
 
-    // the recurrent state, which outlives the call
-    float* state = nullptr;        ///< S * h_v * S
-    float* conv_state = nullptr;   ///< conv_channels * (d_conv-1)
+    // the recurrent state, which outlives the call.  The recurrent part's element width follows
+    // `gdn_state_f16()` - F32 when off, IEEE binary16 when on - which is why `state` is untyped: the launchers
+    // pick the kernel for the configured width.  The conv history is always F32.
+    void* state = nullptr;         ///< S * h_v * S elements, F32 or F16 per gdn_state_f16()
+    float* conv_state = nullptr;   ///< conv_channels * (d_conv-1), F32
 };
 
 /// Bytes needed for `b`, 16-byte aligned between regions.

@@ -32,7 +32,8 @@ struct SessionState {
     int64_t max_cells = 0;
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
-    float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
+    float* gdn_state = nullptr;     ///< (n_gdn_layers) state blocks; the byte count and element width are
+                                    ///< `gdn_state_bytes`'s (session.cpp) - the recurrent part follows gdn_state_f16()
 
     QsaState* qsa_states = nullptr;      ///< one per QSA layer
     void* qsa_state_arena = nullptr;

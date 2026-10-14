@@ -52,6 +52,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/gdn_state.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -352,6 +353,7 @@ struct Options {
     bool native_ple_key = false;       // unchanged Q2_0 key and CUDA Q8_1 activations
     bool native_moe_combine = false;   // pinned fused CUDA weighted reduction
     bool native_gdn = false;          // pinned CUDA recurrence and preprocessing
+    bool gdn_f16 = false;             // the recurrent state stored as IEEE half (the math stays F32)
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
     bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
     bool native_qsa = false;          // pinned F32 QSA norms and gate
@@ -1878,6 +1880,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-key") o.native_ple_key = true;
         else if (a == "--native-moe-combine") o.native_moe_combine = true;
         else if (a == "--native-gdn") o.native_gdn = true;
+        else if (a == "--gdn-f16") o.gdn_f16 = true;
         else if (a == "--native-flash-attn-short") o.native_flash_attn_short = true;
         else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
         else if (a == "--native-qsa") o.native_qsa = true;
@@ -3094,6 +3097,11 @@ int main(int argc, char** argv) {
     strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
     strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
+    if (!o.gdn_f16) {
+        const char* e = std::getenv("STRATA_GDN_F16");
+        o.gdn_f16 = e != nullptr && e[0] != '0';
+    }
+    strata::kernels::gdn_state_set_f16(o.gdn_f16);
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
@@ -3631,8 +3639,8 @@ int main(int argc, char** argv) {
     const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;   // ~3 MiB per GDN layer, twice, ~15 layers
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
-        return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                        (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
+        return (size_t) s0.gdn_alloc * strata::kernels::gdn_state_layer_bytes(
+                                           g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels, g.ssm_d_conv);
     };
     // #340: with the own prompt buffers chosen by the split's rule (not asked for with --no-prefill-borrow) the
     // boundary is searched as the borrowing configuration would (no reserve): the reserve then only makes the caches
@@ -7838,7 +7846,7 @@ int main(int argc, char** argv) {
                 c.switches = {
                     {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
                     {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
-                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
+                    {"native_gdn", o.native_gdn}, {"gdn_f16", o.gdn_f16}, {"native_flash_attn_short", o.native_flash_attn_short},
                     {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
                     {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
                     {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},

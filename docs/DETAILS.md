@@ -94,6 +94,17 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**Half-precision GDN state (opt-in, `--gdn-f16` / `STRATA_GDN_F16=1`):** the gated delta-net's recurrent
+state is 128 x 48 x 128 elements per layer, 36 layers: 113.2 MB per sequence in F32. This switch stores it as
+IEEE binary16 - 56.6 MB - while every kernel keeps its arithmetic in F32 (an element widens on load, narrows on
+store; the F32 path compiles to exactly the old bits, so the default is unchanged). The conv history that follows
+the recurrence in every layer block stays F32. On an RTX 5090 Laptop (24 GB, IQ3_XXS, the Coder config, 1 run of
+`tools/strata_bench.py --runs 1`): chat decode 10.8 -> 11.9 tok/s (+10%), the agent suite's decode 12.4 -> 12.9
+(+4%), prompts unchanged, the conversation cache's hit rate unchanged (68.9%). A 141-token session file shrinks
+238.3 -> 125.1 MB (-47.5%), and conversation checkpoints (each carries a full state copy) halve with it. Session
+files record the switch in their configuration fingerprint: one saved without the flag restores only into an
+engine started without it. Details: `bench/results-ram-f32` and `bench/results-ram-f16`.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

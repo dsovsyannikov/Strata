@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/gdn_state.hpp"
 
 #include <cuda_runtime.h>
 
@@ -36,12 +37,20 @@ constexpr uint64_t SESSION_STATE_ALIGN = 256;
 
 uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
-/// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
+/// The bytes one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
-/// its own - they cannot share, because the recurrence is the whole point.
-uint64_t gdn_state_floats(const ModelGeometry& g) {
-    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+/// its own - they cannot share, because the recurrence is the whole point.  The recurrent part follows
+/// `gdn_state_f16()` (4 or 2 bytes an element); the conv history is always F32.
+uint64_t gdn_state_bytes(const ModelGeometry& g) {
+    return strata::kernels::gdn_state_layer_bytes(g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels,
+                                                  g.ssm_d_conv);
+}
+
+/// Row `row`'s state block and, inside it, the conv history.  Shared by every code that points a layer at its
+/// own state, so the F16 layout cannot be read one way here and another way there.
+void gdn_state_slice(const ModelGeometry& g, SessionState& s, int64_t row, void*& state, float*& conv) {
+    state = (uint8_t*) s.gdn_state + (size_t) row * gdn_state_bytes(g);
+    conv = (float*) ((uint8_t*) state + strata::kernels::gdn_state_rec_bytes(g.ssm_state_size, g.ssm_v_heads));
 }
 
 }  // namespace
@@ -62,7 +71,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
-    n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
+    n += (uint64_t) gdn_n * gdn_state_bytes(g);
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
         n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
@@ -97,7 +106,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
-    s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
+    s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_bytes(g));
 
     // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
@@ -149,7 +158,7 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
         cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
     }
     // every owned GDN layer's recurrence and conv history
-    cudaMemsetAsync(s.gdn_state, 0, (size_t) s.gdn_alloc * gdn_state_floats(g) * 4, cs);
+    cudaMemsetAsync(s.gdn_state, 0, (size_t) s.gdn_alloc * gdn_state_bytes(g), cs);
     // and every owned QSA layer's cache and indexer
     for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_state_zero(s.qsa_states[s.qsa_ord0 + j], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
@@ -169,8 +178,7 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
     if (is_qsa_layer(g, layer)) return;
     int64_t gdn_index = 0;
     for (int64_t l = 0; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
-    s.gdn.state = s.gdn_state + (size_t) (gdn_index - s.gdn_ord0) * gdn_state_floats(g);
-    s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+    gdn_state_slice(g, s, gdn_index - s.gdn_ord0, s.gdn.state, s.gdn.conv_state);
 }
 
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
@@ -799,8 +807,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
         // shared scratch at the right slice before each call.  Sharing one state across 36 layers would make
         // every layer start from the previous layer's recurrence, which produces a perfectly finite answer.
         if (!is_qsa_layer(g, l)) {
-            s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
-            s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+            gdn_state_slice(g, s, gdn_index, s.gdn.state, s.gdn.conv_state);
             ++gdn_index;
         }
 

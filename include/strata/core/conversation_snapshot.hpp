@@ -46,6 +46,7 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
+    size_t gdn_other = 0;   ///< the same arena in the OTHER recurrent-state width (checkpoints convert across)
 };
 /// Whole-model sizes: `gdn` covers every GDN layer, the indexer sizes are per QSA layer.
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& sizes, std::string& error);

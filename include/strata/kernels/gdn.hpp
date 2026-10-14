@@ -43,7 +43,8 @@ struct GdnShapes {
 
 /// One step of the delta-rule recurrence, IN PLACE on `state`.
 ///
-///   state (S, h_v, S) f32, j fastest, updated in place
+///   state (S, h_v, S) j fastest, updated in place; F32 elements, or IEEE half with `--gdn-f16`
+///         (the arithmetic stays F32 - only the stored element narrows)
 ///   q, k  (h_k, S)    already L2-normalised, and q ALREADY SCALED by 1/sqrt(S) - the two llama.cpp paths
 ///                     apply that scale in different places, so the caller owns it
 ///   v     (h_v, S)
@@ -53,7 +54,7 @@ struct GdnShapes {
 ///
 /// The head pairing is `h % h_k` (MODULO), not `h / (h_v/h_k)` (INTERLEAVE).  `ref/gdn.py` PROPERTY 8 and 11
 /// pin this and the test re-pins it, because both conventions produce well-formed output.
-void gdn_step(float* state, const float* q, const float* k, const float* v, const float* gate,
+void gdn_step(void* state, const float* q, const float* k, const float* v, const float* gate,
               const float* beta, float* o, const GdnShapes& s, void* stream);
 
 /// `ggml_ssm_conv` with the carried state prepended.  Updates `conv_state` in place.

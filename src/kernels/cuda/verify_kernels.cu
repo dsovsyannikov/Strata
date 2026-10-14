@@ -3,6 +3,8 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/gdn_state.hpp"
+#include "strata/kernels/gdn_state_io.cuh"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
 #include "strata/kernels/dp4a.hpp"
@@ -170,8 +172,8 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_kernel(int conv_blocks, float* 
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
 // DBG (STRATA_DBG_GDN=1, #937): a window count the launch never allowed (n_keep is read from device memory; n_max is the
 // rows the window holds) is reported and the commit skipped, where the fault would be a memory-aperture violation
-template <bool DBG>
-__global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
+template <bool DBG, typename ST>
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(ST* __restrict__ state,
                                                                   const float* __restrict__ hbuf, int C,
                                                                   const float* __restrict__ gate,
                                                                   const float* __restrict__ beta,
@@ -194,10 +196,10 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     const int qh = head % h_k;
     const int qk = S * h_k;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * row_stride]);
     for (int t = 0; t < n; ++t) {
         const float* ht = hbuf + (size_t) t * C;
         __syncthreads();
@@ -215,7 +217,7 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
         for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * row_stride], s[r]);
 }
 
 // S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
@@ -236,8 +238,8 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
-template <bool ALL_OUT, bool Q>
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
+template <bool ALL_OUT, bool Q, typename ST>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(ST* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
                                                                      const float* __restrict__ beta,
@@ -263,10 +265,12 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     }
     const float gam = (rg == 0) ? gamma[col] : 0.0f;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = ALL_OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    for (int r = 0; r < RPG; ++r)
+        s[r] = ALL_OUT ? strata::kernels::gdn_st_get(__ldg(&base[r * row_stride]))
+                       : strata::kernels::gdn_st_get(base[r * row_stride]);
     for (int t = 0; t < n; ++t) {
         const int cur = t & 1, nxt = (t + 1) & 1;
         const float* ht = hbuf + (size_t) t * C;
@@ -320,7 +324,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     }
     if (!ALL_OUT && n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * row_stride], s[r]);
     }
 }
 
@@ -334,8 +338,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
 // norm kernel below has the old kernel's code shape (S x RG threads, rg 0 holding oc), which makes it bitwise equal -
 // the 128-thread version differed from the old kernel by 1 ulp in ~7% of the outputs.
 constexpr int GS_COLS = 32;
-template<bool OUT>
-__global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __restrict__ state,
+template<bool OUT, typename ST>
+__global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(ST* __restrict__ state,
                                                                       const float* __restrict__ hbuf, int C,
                                                                       const float* __restrict__ gate,
                                                                       const float* __restrict__ beta,
@@ -355,10 +359,10 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
     const int value_dim = S * h_v;
     const int n = n_keep ? *n_keep : T;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * row_stride]);
     for (int t = 0; t < n; ++t) {
         const float* ht = hbuf + (size_t) t * C;
         __syncthreads();
@@ -388,7 +392,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * row_stride], s[r]);
     }
 }
 
@@ -397,8 +401,8 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
 // row up front, the next row's k / q while the current one computes. The arithmetic and its order are
 // gdn_step_split_kernel<false>'s (gfx1151 harness: state bitwise equal; 44.5 -> 39.1 us at 1 row, 47.4 -> 40.5 at 2,
 // 53.8 -> 42.9 at 4, h_v 48). With outputs the prefetch lost (register pressure), so the window keeps the plain split.
-template<int MAXT>
-__global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* __restrict__ state,
+template<int MAXT, typename ST>
+__global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(ST* __restrict__ state,
                                                                         const float* __restrict__ hbuf, int C,
                                                                         const float* __restrict__ gate,
                                                                         const float* __restrict__ beta, int h_k,
@@ -426,10 +430,10 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
     float kn = 0.0f, qn = 0.0f;
     if (n > 0) { kn = hbuf[qk + qh * S + tid]; qn = hbuf[qh * S + tid]; }
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    ST* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * row_stride]);
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
         if (t >= n) break;
@@ -458,7 +462,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * row_stride], s[r]);
     }
 }
 // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) per head and token: gdn_step_norm_multi_kernel's tail with its
@@ -990,9 +994,10 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     check("gdn_ab_multi");
 }
 
-void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
-                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
+template <typename ST>
+void gdn_step_norm_multi_impl(ST* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                              const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                              const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
     GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);   // S26: non-null = also the outputs' q8_1 (STRATA_QFUSE)
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
@@ -1005,10 +1010,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
         const dim3 grid((unsigned) h_v, S / GS_COLS), block(GS_COLS, RG);
         if (t_out_begin >= n_tok) {   // no outputs (the commit): the state only
-            gdn_state_replay_kernel<kVerifyMaxT><<<grid, block, 0, (cudaStream_t) stream>>>(
+            gdn_state_replay_kernel<kVerifyMaxT, ST><<<grid, block, 0, (cudaStream_t) stream>>>(
                 state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
         } else {
-            gdn_step_split_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
+            gdn_step_split_kernel<true, ST><<<grid, block, 0, (cudaStream_t) stream>>>(
                 state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, n_keep, t_out_begin);
             const dim3 ng((unsigned) h_v, (unsigned) (n_tok - t_out_begin));
             if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
@@ -1023,9 +1028,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }();
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
         static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
-        if (dbg) gdn_step_commit_kernel<true><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        if (dbg) gdn_step_commit_kernel<true, ST><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
-        else gdn_step_commit_kernel<false><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        else gdn_step_commit_kernel<false, ST><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
         check("gdn_step_commit");
         return;
@@ -1033,18 +1038,29 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
     if (xq && t_out_begin < n_tok) {
-        if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+        if (all_out) gdn_step_norm_multi_kernel<true, true, ST><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
-        else gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+        else gdn_step_norm_multi_kernel<false, true, ST><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
     } else if (all_out) {
-        gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+        gdn_step_norm_multi_kernel<true, false, ST><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
     } else {
-        gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+        gdn_step_norm_multi_kernel<false, false, ST><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr);
     }
     check("gdn_step_norm_multi");
+}
+
+void gdn_step_norm_multi(void* state_v, const float* h, int conv_channels, const float* gate, const float* beta,
+                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
+    if (strata::kernels::gdn_state_f16())
+        gdn_step_norm_multi_impl<__half>((__half*) state_v, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v,
+                                         n_tok, n_keep, stream, t_out_begin, xq_out);
+    else
+        gdn_step_norm_multi_impl<float>((float*) state_v, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v,
+                                        n_tok, n_keep, stream, t_out_begin, xq_out);
 }
 
 namespace {

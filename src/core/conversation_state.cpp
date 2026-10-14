@@ -2,6 +2,8 @@
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 
+#include "strata/kernels/gdn_state.hpp"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -110,10 +112,17 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z,
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] < 0 || (i != 1 && key[i] == 0)) return fail(error, "invalid model geometry");
     size_t recurrence = 0, convolution = 0;
+    // a checkpoint written by the OTHER width restores too (converted on the host), so both byte counts appear
+    // below; this one is the running width's
+    const uint64_t esize = (uint64_t) strata::kernels::gdn_state_esize();
+    const uint64_t other = esize == 4 ? (uint64_t) 2 : (uint64_t) 4;
     if (!product(recurrence, {(uint64_t) g.ssm_state_size, (uint64_t) g.ssm_v_heads, (uint64_t) g.ssm_state_size}) ||
-        !product(convolution, {(uint64_t) g.ssm_conv_channels, (uint64_t) (g.ssm_d_conv - 1)}) ||
+        !product(convolution, {(uint64_t) g.ssm_conv_channels, (uint64_t) (g.ssm_d_conv - 1), sizeof(float)}) ||
+        !product(recurrence, {recurrence, esize}) ||
+        !product(z.gdn_other, {recurrence / esize, other}) || !add(z.gdn_other, convolution) ||
+        !product(z.gdn_other, {(uint64_t) g.n_gdn_layers(), z.gdn_other, 1}) ||
         !add(recurrence, convolution) ||
-        !product(z.gdn, {(uint64_t) g.n_gdn_layers(), recurrence, sizeof(float)}) ||
+        !product(z.gdn, {(uint64_t) g.n_gdn_layers(), recurrence, 1}) ||
         !product(z.ple, {strata::kernels::NG_HIST, strata::kernels::NG_HC_DIM, sizeof(float)}) ||
         !product(z.tail, {(uint64_t) (strata::kernels::qsa_real_shapes().idx_block - 1),
                           (uint64_t) g.idx_key_dim, sizeof(float)}) ||
@@ -145,7 +154,8 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
+    if ((c.gdn.size() != z.gdn && c.gdn.size() != z.gdn_other) ||
+        c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
         c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
         c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
         return fail(error, "invalid checkpoint running-state payload");
@@ -176,8 +186,21 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    if (c.gdn.size() == z.gdn) {
+        if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
+            !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    } else {
+        // a checkpoint from the other state width (an F32 file into an F16 run or the reverse): the recurrent
+        // part converts on the host, the conv history copies through unchanged
+        std::vector<uint8_t> native(z.gdn);
+        strata::kernels::gdn_state_convert_arena(native.data(), strata::kernels::gdn_state_f16(), c.gdn.data(),
+                                                  (size_t) ss.gdn_alloc,
+                                                 (size_t) g.ssm_state_size * (size_t) g.ssm_v_heads *
+                                                     (size_t) g.ssm_state_size,
+                                                 (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1));
+        if (!copy(ss.gdn_state, native.data(), native.size(), error) ||
+            !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    }
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
@@ -314,7 +337,7 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     l.max_kv_layers = layers + 1;
     l.geometry = geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
-    l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+    l.max_state_bytes = {std::max(z.gdn, z.gdn_other), ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
     l.max_kv_bytes.assign(layers + 1, {});
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
