@@ -182,6 +182,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
+                 src/core/conversation_file.cpp)
+  target_include_directories(conversation_disk_test PRIVATE include)
+  add_test(NAME conversation_disk_test COMMAND conversation_disk_test)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
@@ -489,6 +493,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_nf4.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -501,6 +506,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
+                          src/kernels/gdn_state.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
@@ -685,7 +691,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_disk.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1585,6 +1591,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  # NVFP4 KV (kv_nf4.hpp): the codec against its host reference, the append kernels bit for bit, the
+  # gather's dequantized values, and the Hadamard invariance (GPU, synthetic, no model)
+  add_executable(kv_nf4_parity src/kernels/kv_nf4_parity.cpp)
+  target_include_directories(kv_nf4_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_nf4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_nf4_parity COMMAND kv_nf4_parity)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)

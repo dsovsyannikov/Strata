@@ -28,6 +28,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/auto_cache.hpp"
@@ -61,12 +62,14 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/gdn_state.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nf4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -521,6 +524,7 @@ struct Options {
     bool native_ple_key = false;       // unchanged Q2_0 key and CUDA Q8_1 activations
     bool native_moe_combine = false;   // pinned fused CUDA weighted reduction
     bool native_gdn = false;          // pinned CUDA recurrence and preprocessing
+    bool gdn_f16 = false;             // the recurrent state stored as IEEE half (the math stays F32)
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
     bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
     bool native_qsa = false;          // pinned F32 QSA norms and gate
@@ -817,6 +821,13 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --conversation-cache-storage ram|disk: where a parked conversation's snapshot lives.  "ram" (the default)
+    /// keeps it in host RAM as before; "disk" writes each snapshot as a session-format file
+    /// (conversation_file.hpp) under --conversation-cache-dir, so a parked conversation holds no host RAM beyond
+    /// the light index (token ids, image keys) that matches it.  --conversation-cache-mib is that store's budget.
+    std::string conversation_cache_storage = "ram";
+    /// --conversation-cache-dir DIR: the folder "disk" parking writes its snapshots to (created at start).
+    std::string conversation_cache_dir;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -908,7 +919,9 @@ void usage() {
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
-                 "                       (vs int8's 1,056); streams with --kv-resident too\n"
+                 "  --kv nvfp4           4-bit E2M1 + an E4M3 scale per 16 values after the Hadamard\n"
+                 "                       rotation (kv_nf4.hpp, NInfer's KV codec): q4_0's 576 B/cell,\n"
+                 "                       finer scale groups (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -969,8 +982,15 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
+                 "  --conversation-cache-mib N  --serve: budget for parked conversations, in host RAM (the default
+"
+                 "                       storage) or on disk (default: sized from the free RAM, up to 8192; 0 = off)
+"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-storage S  --serve: ram (default) or disk - where parked snapshots live.\n"
+                 "                       disk writes session-format files under --conversation-cache-dir and frees the\n"
+                 "                       host RAM a park held (restore then reads the file back; no layer split)\n"
+                 "  --conversation-cache-dir DIR  --serve: the folder disk parking writes its snapshots to\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -3032,6 +3052,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-key") o.native_ple_key = true;
         else if (a == "--native-moe-combine") o.native_moe_combine = true;
         else if (a == "--native-gdn") o.native_gdn = true;
+        else if (a == "--gdn-f16") o.gdn_f16 = true;
         else if (a == "--native-flash-attn-short") o.native_flash_attn_short = true;
         else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
         else if (a == "--native-qsa") o.native_qsa = true;
@@ -3202,6 +3223,15 @@ int main(int argc, char** argv) {
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-cache-storage") {
+            const std::string v = next("--conversation-cache-storage");
+            if (v != "ram" && v != "disk") {
+                std::fprintf(stderr, "strata generate: --conversation-cache-storage takes ram or disk\n");
+                return 2;
+            }
+            o.conversation_cache_storage = v;
+        }
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -3578,6 +3608,27 @@ int main(int argc, char** argv) {
                      primary_device);
         return 2;
     }
+    // --conversation-cache-storage disk: the parked snapshot IS a session-format file (conversation_file.hpp), so
+    // the store has the same limits a session SAVE has - no layer split - and its folder has to exist
+    if (o.conversation_cache_storage == "disk") {
+        if (o.conversation_cache_dir.empty()) {
+            std::fprintf(stderr, "strata generate: --conversation-cache-storage disk needs --conversation-cache-dir DIR\n");
+            return 2;
+        }
+        if (!o.layer_split.empty() || multi_gpu) {
+            std::fprintf(stderr, "strata generate: conversation parking with disk storage does not support a layer "
+                                 "split (the session file format has no stage images); use the default ram storage "
+                                 "or drop --layer-split\n");
+            return 2;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(o.conversation_cache_dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "strata generate: --conversation-cache-dir %s cannot be created: %s\n",
+                         o.conversation_cache_dir.c_str(), ec.message().c_str());
+            return 2;
+        }
+    }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
@@ -3726,12 +3777,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "nvfp4") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or nvfp4\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_nf4(o.kv == "nvfp4"); // NInfer's KV codec: E2M1 + E4M3 scale per 16 (kv_nf4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
@@ -4547,6 +4599,11 @@ int main(int argc, char** argv) {
     strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
     strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
+    if (!o.gdn_f16) {
+        const char* e = std::getenv("STRATA_GDN_F16");
+        o.gdn_f16 = e != nullptr && e[0] != '0';
+    }
+    strata::kernels::gdn_state_set_f16(o.gdn_f16);
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
@@ -5185,8 +5242,8 @@ int main(int argc, char** argv) {
     const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;   // ~3 MiB per GDN layer, twice, ~15 layers
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
-        return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                        (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
+        return (size_t) s0.gdn_alloc * strata::kernels::gdn_state_layer_bytes(
+                                           g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels, g.ssm_d_conv);
     };
     // #340: with the own prompt buffers chosen by the split's rule (not asked for with --no-prefill-borrow) the
     // boundary is searched as the borrowing configuration would (no reserve): the reserve then only makes the caches
@@ -10332,7 +10389,9 @@ int main(int argc, char** argv) {
         ConvCheckpoint::PromptPlan seg_plan;
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
-        // (the snapshots accept a null draft)
+        // (the snapshots accept a null draft).  storage "disk" (opt-in) parks into session-format files under
+        // --conversation-cache-dir: the same policy, a file instead of host RAM (conversation_disk.hpp)
+        
         // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
         // loaded (an agent Harness alternates a long main conversation with shorter ones; with the cache off every request read
         // its whole prompt again, Reused 0 on 12 of 12).  An explicit value, 0 included, is never touched.
@@ -10366,7 +10425,8 @@ int main(int argc, char** argv) {
         }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens,
+            o.conversation_cache_storage, o.conversation_cache_dir);
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -10426,7 +10486,7 @@ int main(int argc, char** argv) {
                 c.switches = {
                     {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
                     {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
-                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
+                    {"native_gdn", o.native_gdn}, {"gdn_f16", o.gdn_f16}, {"native_flash_attn_short", o.native_flash_attn_short},
                     {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
                     {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
                     {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
@@ -10455,6 +10515,51 @@ int main(int argc, char** argv) {
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
         };
+        // Disk parking's file side: every snapshot goes through the session format, bound to the same identity a
+        // SAVE is (another model's or config's file is refused on read), with the SAVE free-space preflight on
+        // write and the RESTORE read limits and RAM preflight on read (conversation_disk.hpp).
+        if (conversations.disk()) {
+            strata::core::ConversationDiskIo io;
+            io.write = [&](const std::string& path, const strata::core::SavedConversation& image, size_t& bytes,
+                           std::string& e) {
+                strata::core::SessionFileIdentity id;
+                if (!session_identity(id, e, nullptr)) return false;
+                strata::core::SessionWriteOptions wo;
+                wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                // a beat per 16 MiB block, and the same bounded allowance a SAVE's blocking steps get (flush,
+                // rename), so the watchdog does not mistake a disk park for a stuck request (progress.hpp)
+                wo.progress = [](uint64_t, uint64_t) { strata::core::progress_allow(0); };
+                wo.phase = [](const char*, uint64_t bytes) {
+                    strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
+                };
+                strata::core::SessionStatus st;
+                return strata::core::session_file_write(path, image, id, bytes, e, wo, &st);
+            };
+            io.read = [&](const std::string& path, strata::core::SavedConversation& image, size_t& bytes,
+                          std::string& e) {
+                strata::core::SessionFileIdentity id;
+                if (!session_identity(id, e, nullptr)) return false;
+                strata::core::SessionReadLimits limits;
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                limits.admit = [floor](uint64_t need, std::string& why) {
+                    const auto mem = strata::core::sample_host_memory();
+                    const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                    why = "not enough RAM to read it back (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                          std::to_string(floor >> 20) + " MiB needed)";
+                    return false;
+                };
+                if (!strata::core::conversation_session_read_limits(
+                        limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                        (uint64_t) std::max(o.prompt_cache, 1), e))
+                    return false;
+                strata::core::SessionStatus st;
+                return strata::core::session_file_read(path, id, image, bytes, e, limits, &st);
+            };
+            conversations.disk_store().io(std::move(io));
+            std::fprintf(stderr, "strata serve: conversation cache: disk storage on (%s, budget %lld MiB)\n",
+                         o.conversation_cache_dir.c_str(), (long long) o.conversation_cache_mib);
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
@@ -10612,8 +10717,11 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest())
+                // disk parking: the parked files hold no host RAM, so evicting them cannot help this gate - the
+                // snapshot is transient here (captured, written, freed), and the admission below still demands
+                // room for it above the floor
+                while (!conversations.disk() && !admit() && conversations.size() > 0 &&
+                       evicted < conversations.slots() && conversations.evict_oldest())
                     ++evicted;
                 if (!admit()) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
@@ -12193,9 +12301,11 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                        "conversation_cache_storage=%s conversation_cache_min_free_mib=%lld "
+                        "conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "
+",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -12206,6 +12316,7 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        o.conversation_cache_storage.c_str(),
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
@@ -13601,7 +13712,7 @@ int main(int argc, char** argv) {
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
                             const auto freed = strata::core::session_save_reclaim(
-                                checks, conversations, sl, floor, strata::core::available_host_bytes);
+                                checks, conversations.ram(), sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
                                 // A removed tail must not mark a later checkpoint at this length as a tail.
                                 if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
@@ -14176,8 +14287,15 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
-                incoming.emplace(conversations.take(parked.index));
+            // disk parking's take can fail (an unreadable or foreign file): the entry and its file are gone, and
+            // the request falls through to the live/checkpoint/slot sources and, at worst, reads the prompt
+            if (parked.tokens > std::max(resume, slot_tokens) && !borrow) {
+                if (auto back = conversations.take(parked.index)) incoming.emplace(std::move(*back));
+                else if (conversations.disk())
+                    std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s)
+",
+                                 conversations.last_error().c_str());
+            }
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -17020,7 +17138,10 @@ int main(int argc, char** argv) {
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
+                    if (st.kv_nf4) {
+                        const int64_t nfb = (int64_t) strata::kernels::kv_nf4_bytes_per_head((int) qs.head_dim);
+                        a = {{h ? st.host.k_nf4 : st.k_nf4, nfb}, {h ? st.host.v_nf4 : st.v_nf4, nfb}};
+                    } else if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {
