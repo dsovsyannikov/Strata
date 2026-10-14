@@ -1,18 +1,21 @@
 // src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the tensor-core prompt attention (qsa_prompt_attn.hpp)
 // against the FP32 kernel it replaces (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
 //
-// Int8, FP16 and Q4_0 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
-// widest, a recent window plus older cells that drift slowly from one query to the next, so neighbours share most
+// Int8, FP16, Q4_0 and NVFP4 pools with random codes, scales and queries; selections shaped like the prompt path's
+// (the 2,051 widest, a recent window plus older cells that drift slowly from one query to the next, so neighbours share most
 // of them as they do in a real prompt; short contexts take every cell). Checks:
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
+// NVFP4 (fmt 4): mode 6 quantizes Q to FP4 (hi + lo), so the FP64 reference quantizes Q the same way (the
+// kernel's semantics), and check 2 is the documented Q-noise allowance of 5% (QA_QREF=0: the raw-Q reference).
 // HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nf4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -40,15 +43,15 @@ template <typename T> T* up(const std::vector<T>& h) {
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0, 4 nvfp4
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-    if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
-        int dev = 0, major = 0;
+    if (fmt == 2 || fmt == 4) {   // modes 4 and 5 run on sm_80 and newer only: below that the dispatcher
+        int dev = 0, major = 0;   // keeps the old kernel (mode 6, the native-FP4 scores, needs sm_120a)
         ck(cudaGetDevice(&dev), "device");
         ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cc");
         if (major < 8) {
-            std::printf("SKIP q4_0 ctx %lld: the tensor-core kernel takes Q4_0 KV on sm_80+ only (this device: sm_%d)\n",
-                        (long long) ctx, major);
+            std::printf("SKIP %s ctx %lld: the tensor-core kernel takes this KV on sm_80+ only (this device: sm_%d)\n",
+                        fmt == 2 ? "q4_0" : "nvfp4", (long long) ctx, major);
             return 0;
         }
     }
@@ -65,7 +68,23 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     std::vector<uint16_t> ks, vs, kh, vh;
     std::vector<uint8_t> k4, v4;   // q4_0: 8 blocks of {fp16 d, 16 code bytes} per row (kv_q4.hpp)
     constexpr int64_t B4 = 18, ROW4 = 8 * B4;
-    if (fmt == 2) {
+    std::vector<uint8_t> k4n, v4n;   // nvfp4: one block_nf4 (128 code bytes + 16 E4M3 bytes) per row
+    constexpr int64_t ROWN4 = (int64_t) sizeof(k::block_nf4);
+    if (fmt == 4) {
+        // quantized with the engine's own codec from normal floats (the scales spread over two decades by
+        // construction: the value range goes through amax/6 and the E4M3 grid), so the FP64 reference
+        // decodes exactly what the pool holds
+        k4n.resize(rows * ROWN4); v4n.resize(rows * ROWN4);
+        for (auto* pool : {&k4n, &v4n})
+            for (int64_t r = 0; r < rows; ++r) {
+                float x[16];
+                for (int64_t g = 0; g < HD / 16; ++g) {
+                    for (int j = 0; j < 16; ++j) x[j] = nd(rng) * 1.5f;
+                    uint8_t* blk = pool->data() + r * ROWN4;
+                    k::nf4_quantize_group16(x, blk[128 + g], blk + g * 8);
+                }
+            }
+    } else if (fmt == 2) {
         std::uniform_int_distribution<int> byte(0, 255);
         // the scales as a q4_0 pool holds them: signed (ggml's d = max / -8) and spread over two decades, so a chunk's
         // cells mix signs and magnitudes (a positive-only bound on them overflowed FP16 on real K/V)
@@ -161,7 +180,11 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             if (h[0] == want && h[2] == nq && h[1] + h[2] == ctx && h[3] == cap) at = data;
             std::fseek(f, (long) h[2] * h[3] * 4, SEEK_CUR);
         }
-        if (at < 0) { std::fprintf(stderr, "QA_DUMP: no record for layer %d, T %lld, ctx %lld\n", want, (long long) nq, (long long) ctx); std::exit(2); }
+        if (at < 0) {   // a replay file covers the shapes the engine ran; other shapes just skip
+            std::printf("SKIP QA_DUMP: no record for layer %d, T %lld, ctx %lld\n", want, (long long) nq,
+                        (long long) ctx);
+            return 0;
+        }
         std::fseek(f, at, SEEK_SET);
         if (std::fread(ids.data(), 4, ids.size(), f) != ids.size()) std::exit(2);
         std::fclose(f);
@@ -182,7 +205,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
     k::QsaAttnPools pl;
-    if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
+    if (fmt == 4) { pl.k_nf4 = up(k4n); pl.v_nf4 = up(v4n); }
+    else if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
@@ -194,6 +218,13 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int j = (int) (d % 32);
         const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
         return (double) (code - 8) * h2f(sc);
+    };
+    // an nvfp4 value: group d/16 of the row, element d%16, through the engine's own decode
+    auto nf4v = [&](const std::vector<uint8_t>& pool, int64_t row, int64_t d) {
+        const uint8_t* blk = pool.data() + row * ROWN4;
+        float out[16];
+        k::nf4_dequant_group16(blk + (d / 16) * 8, blk[128 + d / 16], out);
+        return (double) out[d % 16];
     };
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
@@ -226,11 +257,36 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         for (float x : nw) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
         std::printf("NEWHASH %016llx\n", (unsigned long long) hh);
     }
-    // 1. FP64 reference on a sample of queries
-    double err_old = 0, err_new = 0, ref_scale = 0;
+    // 1. FP64 reference on a sample of queries; fmt 4: Q quantized the mode-6 way (hi + a lo residual, the
+    // engine codec's own math on the host) and K/V dequantized - the kernel's exact semantics, as q4_0's
+    // reference decodes its pool.  The raw-Q gap that remains (a few % of the output scale, printed below)
+    // is mode 6's deliberate Q-in-FP4 approximation, gated end-to-end by the needle test, not here.
+    // QA_QREF=0: the raw-Q reference (debug).
+    const char* qr = std::getenv("QA_QREF");
+    const bool qref = fmt == 4 && !(qr != nullptr && qr[0] == '0');
+    std::vector<float> qq((size_t) NH * HD);
+    double err_old = 0, err_new = 0, ref_scale = 0, err_dump = 0;
+    int64_t di = 0, dh = 0, dd = 0;
+    double dr = 0;
     for (int64_t i = 0; i < nq; i += std::max<int64_t>(1, nq / 16)) {
         const int64_t w = steps[i * k::kStepCount + k::kStepWidth];
         const int32_t* sel = ids.data() + i * cap;
+        if (qref) {   // this query's Q quantized the mode-6 way: hi + a lo residual per group of 16
+            for (int64_t h = 0; h < NH; ++h)
+                for (int64_t g = 0; g < HD / 16; ++g) {
+                    float x[16], deq[16];
+                    for (int j = 0; j < 16; ++j) x[j] = q[(size_t) ((i * NH + h) * HD + g * 16 + j)];
+                    uint8_t sb, qs8[8];
+                    k::nf4_quantize_group16(x, sb, qs8);
+                    k::nf4_dequant_group16(qs8, sb, deq);   // deq = the hi half's represented values
+                    for (int j = 0; j < 16; ++j) x[j] -= deq[j];
+                    k::nf4_quantize_group16(x, sb, qs8);
+                    k::nf4_dequant_group16(qs8, sb, deq);   // deq = the lo half's represented residual
+                    for (int j = 0; j < 16; ++j)
+                        qq[(size_t) (h * HD + g * 16 + j)] =
+                            (q[(size_t) ((i * NH + h) * HD + g * 16 + j)] - x[j]) + deq[j];
+                }
+        }
         for (int64_t h = 0; h < NH; ++h) {
             const int64_t kvh = h / (NH / NKV);
             std::vector<double> sco((size_t) w);
@@ -239,9 +295,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 2 ? q4v(k4, row, d)
+                    const double kv = fmt == 4 ? nf4v(k4n, row, d)
+                                      : fmt == 2 ? q4v(k4, row, d)
                                       : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
-                    a += (double) q[(i * NH + h) * HD + d] * kv;
+                    a += (double) (qref ? qq[(size_t) (h * HD + d)] : q[(i * NH + h) * HD + d]) * kv;
                 }
                 sco[c] = a / 16.0;
                 mx = std::max(mx, sco[c]);
@@ -252,7 +309,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                    const double vv = fmt == 4 ? nf4v(v4n, row, d)
+                                      : fmt == 2 ? q4v(v4, row, d)
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
@@ -261,7 +319,22 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
+                if (std::fabs(nw[at] - r) > err_dump) {
+                    err_dump = std::fabs(nw[at] - r);
+                    di = i; dh = h; dd = d; dr = r;
+                }
             }
+        }
+    }
+    if (std::getenv("QA_WORST") && err_dump > 1e-4) {   // the worst spot's neighbourhood: old vs new per dim
+        std::printf("WORST q %lld head %lld dim %lld: ref %.6f old %.6f new %.6f\n", (long long) di,
+                    (long long) dh, (long long) dd, dr, o[(size_t) (di * NH + dh) * HD + dd],
+                    nw[(size_t) (di * NH + dh) * HD + dd]);
+        const int64_t d0 = (dd / 8) * 8;
+        for (int64_t j = 0; j < 8; ++j) {
+            const size_t at = (size_t) ((di * NH + dh) * HD + d0 + j);
+            std::printf("  d %lld: old %9.5f new %9.5f (new/old %7.4f)\n", (long long) (d0 + j), o[at], nw[at],
+                        o[at] != 0.0 ? nw[at] / o[at] : 0.0);
         }
     }
     // 2. new vs old everywhere
@@ -286,16 +359,19 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = diff <= 1e-4 * scale;
+    // fmt 4's new kernel quantizes Q to FP4 (hi + lo): against the raw-Q old kernel the gap is that
+    // approximation by design, so the gate is 5% of the scale (the printed number tracks it)
+    const bool ok2 = diff <= (fmt == 4 ? 5e-2 : 1e-4) * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
+                ok1 && ok2 ? "PASS" : "FAIL", fmt == 4 ? "nvfp4" : fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
     cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
     cudaFree((void*) pl.k_pool); cudaFree((void*) pl.v_pool); cudaFree((void*) pl.page_table);
     cudaFree((void*) pl.k_q4); cudaFree((void*) pl.v_q4);
+    cudaFree((void*) pl.k_nf4); cudaFree((void*) pl.v_nf4);
     return ok1 && ok2 ? 0 : 1;
 }
 }  // namespace
@@ -327,6 +403,8 @@ int main(int argc, char** argv) {
     fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
+    fails += run(4, ctx, nq, reps);   // NVFP4 KV (mode 6 on sm_120a, mode 5 below): env A/B in the shell
+    fails += run(4, 1500, std::min<int64_t>(nq, 1500), reps);
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge

@@ -77,15 +77,13 @@ __device__ __forceinline__ void load8_nf4(const QsaAttnPools& p, bool value, lon
     constexpr int bytes_per_head = (int) sizeof(block_nf4);   // one head-cell row IS one 144 B block
     const block_nf4* blk = reinterpret_cast<const block_nf4*>((value ? p.v_nf4 : p.k_nf4) + row * bytes_per_head);
     const int g = d0 / NF4_GROUP;
-    const int i = d0 % NF4_GROUP;              // 0 or 8: the low or the high nibble of the group's 8 bytes
+    const int i = d0 % NF4_GROUP;              // 0 or 8: the group's first or second 8-element half
     const float sc = nf4_e4m3_decode(blk->sc[g]);
-    const uint8_t* qs = blk->qs + g * (NF4_GROUP / 2);   // both halves live in these same 8 bytes
-    if (i == 0) {
+    const uint8_t* qs = blk->qs + g * (NF4_GROUP / 2) + (i >> 1);   // element d: byte d/2, nibble d%2
 #pragma unroll
-        for (int k = 0; k < 8; ++k) out[k] = nf4_e2m1_decode(qs[k] & 0x0F) * sc;
-    } else {
-#pragma unroll
-        for (int k = 0; k < 8; ++k) out[k] = nf4_e2m1_decode(qs[k] >> 4) * sc;
+    for (int k = 0; k < 4; ++k) {
+        out[2 * k] = nf4_e2m1_decode(qs[k] & 0x0F) * sc;
+        out[2 * k + 1] = nf4_e2m1_decode(qs[k] >> 4) * sc;
     }
 }
 template <int KV_MODE>
@@ -284,8 +282,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
             const int e = t % NF4_GROUP;
             const block_nf4* nblk = reinterpret_cast<const block_nf4*>(p.v_nf4 + srow[c] * nf4_bph);
             const float nd = nf4_e4m3_decode(nblk->sc[g]);
-            const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e & 7)];
-            v = nf4_e2m1_decode(e < 8 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
+            const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e >> 1)];
+            v = nf4_e2m1_decode(e & 1 ? (nbyte >> 4) : (nbyte & 0x0F)) * nd;
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
             const int b = t / QK4_0;
@@ -382,8 +380,8 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
         const int e = d % NF4_GROUP;
         const block_nf4* nblk = reinterpret_cast<const block_nf4*>(p.v_nf4 + row * nf4_bph);
         const float nd = nf4_e4m3_decode(nblk->sc[g]);
-        const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e & 7)];
-        return nf4_e2m1_decode(e < 8 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
+        const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e >> 1)];
+        return nf4_e2m1_decode(e & 1 ? (nbyte >> 4) : (nbyte & 0x0F)) * nd;
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;

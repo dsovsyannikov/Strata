@@ -188,6 +188,12 @@ elseif(STRATA_ENABLE_CUDA)
       message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
     endif()
+    # An arch-specific target (the 'a' suffix, e.g. 120a) carries mxf4nvf4 - the native FP4 MMA the NVFP4 prompt
+    # attention scores run on.  The launcher reads the definition to refuse the kernel on a plain-sm_120 build.
+    string(REGEX MATCH "^[0-9]+" _num "${_a}")
+    if(_num GREATER_EQUAL 120 AND _a MATCHES "a$" AND NOT DEFINED STRATA_CUDA_ARCH_SPECIFIC)
+      add_compile_definitions(STRATA_CUDA_ARCH_SPECIFIC=${_num})
+    endif()
   endforeach()
   if(STRATA_EXPERIMENTAL_SM60)
     # every target sees it: the Pascal / Volta code paths (the Volta prompt attention, PR #600) are compiled into this

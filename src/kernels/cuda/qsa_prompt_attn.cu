@@ -192,9 +192,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 int8_t codes[16];
                 const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    codes[j] = lut[wb[j] & 0x0F];          // element j: the low nibble of byte j
-                    codes[j + 8] = lut[wb[j] >> 4];        // element j + 8: the high nibble
+                for (int j = 0; j < 8; ++j) {   // element 2j: byte j's low nibble; 2j+1: its high nibble
+                    codes[2 * j] = lut[wb[j] & 0x0F];
+                    codes[2 * j + 1] = lut[wb[j] >> 4];
                 }
                 int8_t* dst = kv == 0 ? &S.k[c][g * NF4_GROUP] : &S.v[c][g * NF4_GROUP];
 #pragma unroll
@@ -489,17 +489,18 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool va
     __trap();
 #else
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(valid ? 16 : 0));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa), "l"(gmem), "r"(valid ? 16 : 0)
+                 : "memory");
 #endif
 }
 __device__ __forceinline__ void cp_async_commit() {
 #if STRATA_PA_SM80
-    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.commit_group;\n" :: : "memory");
 #endif
 }
 __device__ __forceinline__ void cp_async_wait1() {
 #if STRATA_PA_SM80
-    asm volatile("cp.async.wait_group 1;\n" ::);
+    asm volatile("cp.async.wait_group 1;\n" :: : "memory");
 #endif
 }
 
@@ -777,6 +778,495 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
         std::exit(1);
     }
     return true;
+}
+
+
+// ---- v3 (NVFP4 KV, sm_120a): Q.K^T on Blackwell's native FP4 tensor cores -----------------------------------------
+// mma.sync.kind::mxf4nvf4.m16n8k64 (e2m1 x e2m1, one ue4m3 scale per 16 k per row/column, scale_vec::4X - the
+// instruction NInfer's linear GEMMs use, mma.cuh's mma_nvfp4_e4m3).  The K pool IS the B operand: its code
+// bytes are adjacent-pair nibbles since the codec change and its 16 E4M3 bytes ARE the four SFB words, so a
+// tile of 8 cells x 256 dims costs 3 shared-memory u32 loads and 2 MMAs (Q hi + lo).  Q is quantized online
+// per (head, 16 dims), hi + a residual lo half - the fp16 kernels' hi/lo trick at 4 bits.  The mma's scale
+// factors vary along k only, so the V side cannot ride it: V's scales are one per (cell, 16 dims) and the
+// P.V reduction runs over cells - P.V keeps mode 5's exact-fp16-code path with V's scales folded into p
+// (vLLM #50416 declined native FP4 P.V for this reason; only SageAttention3 does full FP4 attention, with a
+// two-level P scaling we do not need because our P stays fp16).  The whole file's other modes are unchanged.
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && defined(__CUDA_ARCH_SPECIFIC__) && \
+    __CUDA_ARCH_SPECIFIC__
+#define STRATA_PA_NF4MMA 1
+#else
+#define STRATA_PA_NF4MMA 0
+#endif
+
+constexpr int CH6 = 32;   // cells per chunk: one 8-cell n-tile per warp for q.k; the p.v pass over 32 cells
+
+struct Smem6 {
+    uint8_t kv4[2][2][CH6][sizeof(block_nf4)];   // cp.async double buffer: [stage][K/V][cell][128 codes + 16 scales]
+    float vs[CH6][HD / NF4_GROUP];               // V scales as floats, folded into p as in mode 5
+    uint8_t a4h[16][HD / 2];                     // Q hi codes, adjacent-pair nibbles; rows 12..15 zero
+    uint8_t a4l[16][HD / 2];                     // Q lo (residual) codes
+    uint32_t ash[16][HD / 64];                   // Q hi scale words: [row][k64 chunk] = 4 E4M3 bytes
+    uint32_t asl[16][HD / 64];
+    float s[16][CH6 + 1];
+    uint32_t lut[16];                          // the doubled-E2M1 LUT, in shared: p.v reads it per fragment
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+
+__device__ __forceinline__ void mma_nf4(float* c, const uint32_t* a, uint32_t b0, uint32_t b1, uint32_t sfa,
+                                        uint32_t sfb) {
+#if STRATA_PA_NF4MMA
+    // NInfer's wrapper verbatim (src/ops/common/mma.cuh, mma_nvfp4_e4m3): A 4 regs (a0: row gid, k 8*tig..,
+    // a1: row gid+8, a2/a3 the k 32.. half), B 2 regs (column gid, both k halves), SFA/SFB one reg of four
+    // E4M3 bytes each (byte i scales k block 16i..16i+15), the two u16 scale predicates zeroed
+    asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
+                 "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"((unsigned short) 0),
+                   "h"((unsigned short) 0), "r"(sfb), "h"((unsigned short) 0), "h"((unsigned short) 0));
+#else
+    __trap();   // the host refuses the kernel unless the build targets sm_120a (see launch_nf4)
+#endif
+}
+
+/// Two e4m3 bytes from two floats (round-nearest-even, saturating); `lo` lands in byte 0.
+__device__ __forceinline__ uint32_t e4m3x2(float lo, float hi) {
+    unsigned short r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
+    return (uint32_t) r;
+}
+
+/// An e4m3 byte back to float, branchless (the codec's loop version costs up to 8 multiplies; the p.v
+/// residual needs eight of these per scale group).
+__device__ __forceinline__ float e4m3_dec(uint32_t b) {
+    const uint32_t sign = (b & 0x80u) << 24;
+    const uint32_t exp = (b >> 3) & 0xFu, man = b & 7u;
+    const float norm = __uint_as_float(sign | ((exp + 120u) << 23) | (man << 20));   // (1+m/8)*2^(e-7)
+    const float sub = __uint_as_float(sign) * (float) man * (1.0f / 512.0f);          // man * 2^-9, signed
+    return exp != 0 ? norm : sub;
+}
+
+/// The P.V MMA: kind::f8f6f4 with A = P in e4m3, B = V's E2M1 codes (one per byte, in its HIGH nibble -
+/// tools/f8f6f4_probe.cu pinned the container to bits [7:4] and the fragments to a0: row gid, k[4t..+4),
+/// a1: row gid+8, a2/a3 the k[16.. half; B: column gid, same k slices).
+__device__ __forceinline__ void mma_f8(float* c, const uint32_t* a, const uint32_t* b) {
+#if STRATA_PA_NF4MMA
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e4m3.e2m1.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    __trap();
+#endif
+}
+
+/// 16 floats -> 8 adjacent-pair code bytes + the E4M3 scale byte, the codec's amax/6 order; `deq` returns
+/// the represented values so the caller can form the lo residual.
+__device__ __forceinline__ uint8_t nf4_q16(const float* x, uint8_t* qs8, float* deq) {    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(x[i]));
+    if (amax == 0.0f) {
+#pragma unroll
+        for (int m = 0; m < 8; ++m) qs8[m] = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) deq[i] = 0.0f;
+        return 0;
+    }
+    const float bounded = fminf(448.0f, fmaxf(1.0f / 512.0f, nf4_div_rn(amax, 6.0f)));
+    const uint8_t sb = nf4_e4m3_encode(bounded);
+    const float s = nf4_e4m3_decode(sb);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const uint8_t lo = nf4_e2m1_encode(nf4_div_rn(x[2 * m], s));
+        const uint8_t hi = nf4_e2m1_encode(nf4_div_rn(x[2 * m + 1], s));
+        qs8[m] = (uint8_t) (lo | (hi << 4));
+        deq[2 * m] = nf4_e2m1_decode(lo) * s;
+        deq[2 * m + 1] = nf4_e2m1_decode(hi) * s;
+    }
+    return sb;
+}
+
+template <int PV8>   // 0: the fp16 P.V (default), 1: e4m3 hi+lo, 2: e4m3 hi only - a separate instantiation
+__global__ void __launch_bounds__(THREADS) prompt_attn_nf4_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                  const int32_t* __restrict__ ids,
+                                                                  const int32_t* __restrict__ steps, int n_kv_heads,
+                                                                  int page_size, float scale_log2,
+                                                                  float* __restrict__ attn, int cap) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    Smem6& S = *reinterpret_cast<Smem6*>(smem_raw);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int gid = lane >> 2, tig = lane & 3;
+    if (t < 16) {   // the doubled-E2M1 LUT ({0,.5,1,1.5,2,3,4,6} * 2 are integers): one fill before anything
+        constexpr int8_t l8[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, (int8_t) -1, (int8_t) -2, (int8_t) -3,
+                                   (int8_t) -4, (int8_t) -6, (int8_t) -8, (int8_t) -12};
+        S.lut[t] = (uint32_t) (uint8_t) l8[t];
+    }
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+
+    // Q online: 16 rows (12 heads + 4 zero) x 16 groups of 16 dims, two groups per thread; the codes land in
+    // the mma's adjacent-pair nibble order, each scale byte joins its k64 word (byte stores: a word's four
+    // bytes come from four threads)
+    {
+        constexpr int NGQ = HD / NF4_GROUP;
+        for (int i = t; i < 16 * NGQ; i += THREADS) {
+            const int h = i / NGQ, g = i % NGQ;
+            float x[16], deq[16];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float4 f = h < G ? *reinterpret_cast<const float4*>(q + (size_t) h * HD + g * NF4_GROUP + 4 * j)
+                                       : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                x[4 * j] = f.x; x[4 * j + 1] = f.y; x[4 * j + 2] = f.z; x[4 * j + 3] = f.w;
+            }
+            reinterpret_cast<uint8_t*>(&S.ash[h][0])[g] = nf4_q16(x, &S.a4h[h][g * 8], deq);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) x[j] -= deq[j];
+            reinterpret_cast<uint8_t*>(&S.asl[h][0])[g] = nf4_q16(x, &S.a4l[h][g * 8], deq);
+        }
+    }
+
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+    // the chunk pipeline (v2's shape): K and V rows staged raw with cp.async a chunk ahead, so the loads
+    // hide under the previous chunk's scores and p.v; the LUT widening of V then reads shared, not global
+    auto row_of = [&](int c) -> long long {
+        if (c >= n) return -1;
+        const int cell = __ldg(ids + c);
+        const long long page = (long long) __ldg(p.page_table + cell / page_size);
+        return page < 0 ? -1 : (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+    };
+    auto issue = [&](int c0, int st) {
+#pragma unroll 2
+        for (int i = t; i < 2 * CH6 * 9; i += THREADS) {   // both planes, 144 B = 9 x 16 B pieces per row
+            const int kv = i / (CH6 * 9), rem = i % (CH6 * 9), c = rem / 9, pc = rem % 9;
+            const long long r = row_of(c0 + c);
+            const bool ok = r >= 0;
+            const size_t off = ok ? (size_t) r * sizeof(block_nf4) + pc * 16 : 0;
+            cp_async16(&S.kv4[st][kv][c][0] + pc * 16, (kv ? p.v_nf4 : p.k_nf4) + off, ok);
+        }
+        cp_async_commit();
+    };
+    const int n_chunks = (n + CH6 - 1) / CH6;
+    issue(0, 0);
+
+    // Q's A fragments and SFA words, in registers for the whole kernel (as the int8 kernel keeps q): the
+    // smem loads would be 8-way bank-conflicted (a4h[gid][kk*32+4*tig] maps all quads to one bank), and
+    // re-issuing them per chunk costs more than the MMAs they feed
+    uint32_t ah[HD / 64][4], al[HD / 64][4], sfah[HD / 64], sfal[HD / 64];
+    __syncthreads();   // the Q planes are complete
+    {
+        const int sfrow = ((lane & 1) << 3) | (lane >> 2);   // the quad's SFA row (even lanes row gid, odd gid+8)
+#pragma unroll
+        for (int kk = 0; kk < HD / 64; ++kk) {
+            ah[kk][0] = *reinterpret_cast<const uint32_t*>(&S.a4h[gid][kk * 32 + 4 * tig]);
+            ah[kk][1] = *reinterpret_cast<const uint32_t*>(&S.a4h[gid + 8][kk * 32 + 4 * tig]);
+            ah[kk][2] = *reinterpret_cast<const uint32_t*>(&S.a4h[gid][kk * 32 + 16 + 4 * tig]);
+            ah[kk][3] = *reinterpret_cast<const uint32_t*>(&S.a4h[gid + 8][kk * 32 + 16 + 4 * tig]);
+            al[kk][0] = *reinterpret_cast<const uint32_t*>(&S.a4l[gid][kk * 32 + 4 * tig]);
+            al[kk][1] = *reinterpret_cast<const uint32_t*>(&S.a4l[gid + 8][kk * 32 + 4 * tig]);
+            al[kk][2] = *reinterpret_cast<const uint32_t*>(&S.a4l[gid][kk * 32 + 16 + 4 * tig]);
+            al[kk][3] = *reinterpret_cast<const uint32_t*>(&S.a4l[gid + 8][kk * 32 + 16 + 4 * tig]);
+            sfah[kk] = S.ash[sfrow][kk];
+            sfal[kk] = S.asl[sfrow][kk];
+        }
+    }
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int st = ci & 1, c0 = ci * CH6;
+        const int nh = min(CH6, n - c0);
+        if (ci + 1 < n_chunks) issue(c0 + CH6, st ^ 1);
+        else cp_async_commit();   // an empty group keeps two in flight, so wait1 still completes this chunk's
+        cp_async_wait1();
+        __syncthreads();   // this chunk's K and V rows ready; the previous chunk's p.v is done with vs, s
+        // V scales as floats (halved for the doubled codes the p.v LUT yields); the codes themselves stay
+        // packed - p.v's B fragments LUT them straight out of the raw stage
+        {
+            constexpr int GRP = HD / NF4_GROUP;
+            for (int i = t; i < CH6 * GRP; i += THREADS) {
+                const int c = i / GRP, g = i % GRP;
+                const block_nf4* blk = reinterpret_cast<const block_nf4*>(&S.kv4[st][1][c][0]);
+                S.vs[c][g] = 0.5f * nf4_e4m3_decode(blk->sc[g]);
+            }
+        }
+        __syncthreads();
+        // scores: warp w takes the n-tiles 8*(w + 4*nt) over all 256 dims (CH6/32 of them).  The A fragments
+        // and SFA words only depend on the k64 chunk, so they load once per chunk and serve every tile; a
+        // tile is 4 k64 steps x 2 halves (Q hi + lo) = 8 MMAs - the fp16 path needs 32 for the same block
+        {
+            constexpr int NT = CH6 / 32;
+            float sc[NT][4];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < HD / 64; ++kk) {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const int cb = (warp + 4 * nt) * 8;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&S.kv4[st][0][cb + gid][kk * 32 + 4 * tig]);
+                    const uint32_t b1 =
+                        *reinterpret_cast<const uint32_t*>(&S.kv4[st][0][cb + gid][kk * 32 + 16 + 4 * tig]);
+                    const uint32_t sfb = *reinterpret_cast<const uint32_t*>(&S.kv4[st][0][cb + gid][128 + kk * 4]);
+                    mma_nf4(sc[nt], ah[kk], b0, b1, sfah[kk], sfb);
+                    mma_nf4(sc[nt], al[kk], b0, b1, sfal[kk], sfb);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const int c = (warp + 4 * nt) * 8 + 2 * tig;
+                S.s[gid][c] = c < nh ? sc[nt][0] * scale_log2 : -INFINITY;
+                S.s[gid][c + 1] = c + 1 < nh ? sc[nt][1] * scale_log2 : -INFINITY;
+                S.s[gid + 8][c] = c < nh ? sc[nt][2] * scale_log2 : -INFINITY;
+                S.s[gid + 8][c + 1] = c + 1 < nh ? sc[nt][3] * scale_log2 : -INFINITY;
+            }
+        }
+        __syncthreads();
+        // online softmax: row t/8, 8 cells per thread, 8 threads per row (lanes 8r..8r+7 of a warp)
+        {
+            constexpr int PER = CH6 / 8;
+            const int r = t >> 3, sub = t & 7;
+            float x[PER], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) { x[j] = S.s[r][sub * PER + j]; mx = fmaxf(mx, x[j]); }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.s[r][sub * PER + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v: warp w owns dims [64w, 64w+64). STRATA_NF4_PV8=1: P quantized to e4m3 (hi + lo residual
+        // halves) with V's scales folded in, and V's E2M1 codes fed to kind::f8f6f4 (e4m3 x e2m1) MMAs -
+        // the FP8 rate is twice the FP16 one and one m16n8k32 covers the whole 32-cell chunk, but measured
+        // even (7.5 ms per 32K-chunk against the fp16 path's 7.5): the e4m3 A-build's folds and cvts eat
+        // the MMA win, so the default stays the fp16 path. V's codes ride that mma in bits [5:2] of a byte
+        // each (tools/f8f6f4_probe.cu pinned the container and the fragments). The default path: mode 5's
+        // exact-fp16 codes with V's scales folded into p relative to the chunk's largest, times 2^14, the
+        // running sums rescaled in FP32.
+        {
+            constexpr int GPW = (HD / NF4_GROUP) / 4, JPG = 8 / GPW;   // 4 scale groups per warp, 2 n-tiles each
+            float vdown_g[GPW];
+            float tmp[8][4];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) tmp[j][0] = tmp[j][1] = tmp[j][2] = tmp[j][3] = 0.0f;
+#pragma unroll
+            for (int gi = 0; gi < GPW; ++gi) {
+            const int vg = warp * GPW + gi;
+            float vmax = 0.0f;
+#pragma unroll
+            for (int c = lane; c < CH6; c += 32) vmax = fmaxf(vmax, fabsf(S.vs[c][vg]));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+            if (PV8) {
+                const float vup = vmax > 0.0f ? 256.0f / vmax : 0.0f;
+                vdown_g[gi] = vmax * (1.0f / 256.0f);
+                // A: the folded P of this thread's rows and k slices (a0/a1: rows gid/gid+8, cells
+                // 4*tig..+4; a2/a3: cells 16+4*tig..+4), as e4m3 hi + lo residual
+                uint32_t ah[4], al[4];
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const int row = (r & 1) ? gid + 8 : gid;
+                    const int c0 = (r >> 1) ? 16 + 4 * tig : 4 * tig;
+                    float x[4], dq[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        x[i] = S.s[row][c0 + i] * (2.0f * S.vs[c0 + i][vg] * vup);   // S.vs is halved for the
+                        // doubled-code LUT of the fp16 path; the mma takes the raw E2M1 magnitudes
+                    uint32_t h = 0, l = 0;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const uint32_t ph = e4m3x2(x[2 * i], x[2 * i + 1]);
+                        dq[2 * i] = e4m3_dec(ph & 0xFF);
+                        dq[2 * i + 1] = e4m3_dec(ph >> 8);
+                        h |= (ph & 0xFFFFu) << (16 * i);
+                        if (PV8 == 1) {   // 2: hi only (faster, P at e4m3's own precision)
+                            const uint32_t pl = e4m3x2(x[2 * i] - dq[2 * i], x[2 * i + 1] - dq[2 * i + 1]);
+                            l |= (pl & 0xFFFFu) << (16 * i);
+                        }
+                    }
+                    ah[r] = h;
+                    al[r] = l;
+                }
+#pragma unroll
+                for (int jj = 0; jj < JPG; ++jj) {   // the group's 16 dims as 2 n-tiles of 8
+                    const int j = gi * JPG + jj;
+                    const int d = warp * 64 + j * 8 + gid;
+                    const uint32_t nib = (d & 1) * 4;   // V's code: byte d/2, nibble d%2, then into bits [5:2]
+                    uint32_t b[2];
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        uint32_t bb = 0;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int c = half * 16 + 4 * tig + i;
+                            bb |= ((S.kv4[st][1][c][d >> 1] >> nib) & 0xFu) << (8 * i + 2);
+                        }
+                        b[half] = bb;
+                    }
+                    mma_f8(tmp[j], ah, b);
+                    mma_f8(tmp[j], al, b);
+                }
+            } else {
+                const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f;
+                vdown_g[gi] = vmax * (1.0f / 16384.0f);
+#pragma unroll
+                for (int ks = 0; ks < CH6 / 16; ++ks) {
+                    const int cA = ks * 16 + 2 * tig, cB = cA + 8;
+                    const float w0 = S.vs[cA][vg] * vup, w1 = S.vs[cA + 1][vg] * vup, w2 = S.vs[cB][vg] * vup,
+                                w3 = S.vs[cB + 1][vg] * vup;
+                    const float p00 = S.s[gid][cA] * w0, p01 = S.s[gid][cA + 1] * w1;
+                    const float p10 = S.s[gid + 8][cA] * w0, p11 = S.s[gid + 8][cA + 1] * w1;
+                    const float p02 = S.s[gid][cB] * w2, p03 = S.s[gid][cB + 1] * w3;
+                    const float p12 = S.s[gid + 8][cB] * w2, p13 = S.s[gid + 8][cB + 1] * w3;
+                    uint32_t ah[4], al[4];
+                    ah[0] = pack_h2(p00, p01);
+                    ah[1] = pack_h2(p10, p11);
+                    ah[2] = pack_h2(p02, p03);
+                    ah[3] = pack_h2(p12, p13);
+                    {
+                        const __half2* h = reinterpret_cast<const __half2*>(ah);
+                        float2 f;
+                        f = __half22float2(h[0]); al[0] = pack_h2(p00 - f.x, p01 - f.y);
+                        f = __half22float2(h[1]); al[1] = pack_h2(p10 - f.x, p11 - f.y);
+                        f = __half22float2(h[2]); al[2] = pack_h2(p02 - f.x, p03 - f.y);
+                        f = __half22float2(h[3]); al[3] = pack_h2(p12 - f.x, p13 - f.y);
+                    }
+#pragma unroll
+                    for (int jj = 0; jj < JPG; ++jj) {
+                        const int j = gi * JPG + jj;
+                        const int d = warp * 64 + j * 8 + gid;
+                        const uint32_t nib = (d & 1) * 4;   // 0: byte d/2's low nibble, 4: its high one
+                        const uint32_t e0 = (S.kv4[st][1][cA][d >> 1] >> nib) & 0xFu;
+                        const uint32_t e1 = (S.kv4[st][1][cA + 1][d >> 1] >> nib) & 0xFu;
+                        const uint32_t e2 = (S.kv4[st][1][cB][d >> 1] >> nib) & 0xFu;
+                        const uint32_t e3 = (S.kv4[st][1][cB + 1][d >> 1] >> nib) & 0xFu;
+                        uint32_t b[2];
+                        b[0] = i8x2_to_h2(S.lut[e0] | (S.lut[e1] << 8));
+                        b[1] = i8x2_to_h2(S.lut[e2] | (S.lut[e3] << 8));
+                        mma16816(tmp[j], ah, b);
+                        mma16816(tmp[j], al, b);
+                    }
+                }
+            }
+            }
+            const float a0 = S.alpha[gid], a1 = S.alpha[gid + 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float vdown = vdown_g[j / JPG];
+                acc[j][0] = fmaf(acc[j][0], a0, tmp[j][0] * vdown);
+                acc[j][1] = fmaf(acc[j][1], a0, tmp[j][1] * vdown);
+                acc[j][2] = fmaf(acc[j][2], a1, tmp[j][2] * vdown);
+                acc[j][3] = fmaf(acc[j][3], a1, tmp[j][3] * vdown);
+            }
+        }
+        // p.v reads the raw stage until here; the next iteration's issue overwrites it two chunks ahead
+        __syncthreads();
+    }
+    __syncthreads();
+    const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
+    const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = warp * 64 + j * 8 + 2 * tig;
+        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid + 8 < G)
+            *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    }
+}
+
+bool launch_nf4(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+#if !defined(__HIPCC__)
+    static const int pv8_mode = [] {   // STRATA_NF4_PV8: 0 the fp16 P.V (default - measured even with the
+        // f8f6f4 MMA at twice the FP8 rate, the e4m3 A-build eats the win), 1 hi+lo, 2 hi only
+        const char* v = std::getenv("STRATA_NF4_PV8");
+        return v && (v[0] == '1' || v[0] == '2') ? (v[0] == '2' ? 2 : 1) : 0;
+    }();
+    static bool attr[3][64] = {};   // per (instantiation, device), as above
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const int bytes = (int) sizeof(Smem6);
+    if (dev < 0 || dev >= 64) return false;
+    const bool set = pv8_mode == 1 ? (attr[1][dev] || [&] {
+                         if (cudaFuncSetAttribute(prompt_attn_nf4_kernel<1>,
+                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+                             cudaSuccess) { cudaGetLastError(); return false; }
+                         attr[1][dev] = true; return true;
+                     }())
+                     : pv8_mode == 2 ? (attr[2][dev] || [&] {
+                           if (cudaFuncSetAttribute(prompt_attn_nf4_kernel<2>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+                               cudaSuccess) { cudaGetLastError(); return false; }
+                           attr[2][dev] = true; return true;
+                       }())
+                                     : (attr[0][dev] || [&] {
+                                           if (cudaFuncSetAttribute(prompt_attn_nf4_kernel<0>,
+                                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                                    bytes) != cudaSuccess) {
+                                               cudaGetLastError();
+                                               return false;
+                                           }
+                                           attr[0][dev] = true;
+                                           static bool told = false;   // which kernel runs (A/B debugging)
+                                           if (!told) {
+                                               told = true;
+                                               std::fprintf(stderr,
+                                                            "strata: qsa prompt attention: the native FP4 scores "
+                                                            "(mxf4nvf4) on\n");
+                                           }
+                                           return true;
+                                       }());
+    if (!set) return false;
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        const dim3 grid((unsigned) nb, (unsigned) s.n_head_kv);
+        if (pv8_mode == 1)
+            prompt_attn_nf4_kernel<1><<<grid, THREADS, bytes, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        else if (pv8_mode == 2)
+            prompt_attn_nf4_kernel<2><<<grid, THREADS, bytes, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+        else
+            prompt_attn_nf4_kernel<0><<<grid, THREADS, bytes, st>>>(
+                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (nf4): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) attn; (void) n_q; (void) st;
+    return false;
+#endif
 }
 
 
@@ -1535,8 +2025,36 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
-    if (pools.k_nf4 != nullptr) {   // NVFP4 K and V (--kv nvfp4): mode 5, mode 4's int8-codes trick at a
-        // scale per 16 (kv_nf4.hpp); Turing and older fall back to the decode kernel (qsa_decode_attn_batch)
+    if (pools.k_nf4 != nullptr) {   // NVFP4 K and V (--kv nvfp4).  sm_120a: Q.K^T on the native FP4 tensor
+        // cores (mode 6, above) - the K pool's codes and scale bytes are the mma's B operand and SFB as-is.
+        // STRATA_PROMPT_ATTN_NF4=0: mode 5 (the int8-codes trick, the A/B control).  Turing and older fall
+        // back to the decode kernel (qsa_decode_attn_batch); mode 6 also needs the 120a build (STRATA_PA_NF4MMA)
+        static const bool nf4_mma_off = [] {
+            const char* v = std::getenv("STRATA_PROMPT_ATTN_NF4");
+            return v != nullptr && v[0] == '0';
+        }();
+        static int cc6[64] = {};
+        int dev6 = 0;
+        bool mma_ok = false;
+        if (cudaGetDevice(&dev6) == cudaSuccess && dev6 >= 0 && dev6 < 64) {
+            if (cc6[dev6] == 0) {
+                int major = 0, minor = 0;
+                if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev6) == cudaSuccess &&
+                    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev6) == cudaSuccess)
+                    cc6[dev6] = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
+            }
+            mma_ok = cc6[dev6] >= 120;   // the asm traps below sm_120a, and the build must carry the a suffix
+        } else {
+            cudaGetLastError();
+        }
+        // STRATA_CUDA_ARCH_SPECIFIC (CMake) = the build carries an a-suffixed target, so STRATA_PA_NF4MMA
+        // compiled the real instruction; a plain sm_120 build keeps mode 5
+#ifndef STRATA_CUDA_ARCH_SPECIFIC
+#define STRATA_CUDA_ARCH_SPECIFIC 0
+#endif
+        mma_ok = mma_ok && STRATA_CUDA_ARCH_SPECIFIC >= 120;
+        if (!turing && pools.v_nf4 != nullptr && mma_ok && !nf4_mma_off)
+            return launch_nf4(q, pools, ids, steps, cap, s, attn, n_q, st);
         if (turing || pools.v_nf4 == nullptr) return false;
         return launch<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }

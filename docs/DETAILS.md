@@ -97,18 +97,57 @@ slower. It streams its KV cache like the other formats (`--kv-resident N`): on a
 **NVFP4 KV cache (opt-in, `--kv nvfp4`):** K and V of the twelve QSA layers stored as NVFP4 - 4-bit
 E2M1 codes with one 8-bit E4M3 scale per group of 16 - after the same Walsh-Hadamard rotation as
 `--kv q4_0` (kv_nf4.hpp; the codec transcribes NInfer's `nvfp4_group16_codec.cuh`, including its
-RN-division and the [2^-9, 448] scale clamp, so host and device quantize bit for bit alike).
-576 B per cell and layer - q4_0's bytes - but with twice the scale granularity: 6,912 B per token
-against INT8's 12,672 (-45%). At 128K context that is 0.88 GB of KV against INT8's 1.62 GB; the
-freed VRAM goes to expert slots. The prompt path keeps NInfer's speed trick: the doubled E2M1
-magnitudes {0,.5,1,1.5,2,3,4,6}x2 are exact INT8 codes, so `qsa_prompt_attn` runs them through the
-INT8 tensor cores with the halved E4M3 scale per 16 (mode 5, q4_0's mode 4 at a finer group); a
-16K prompt reads at 291 tok/s against INT8's 336 on an RTX 5090 Laptop (the fallback decode kernel
-did 189). Needle 16K at depths 10/50/90: 3/3 found, the same as INT8. Streams with --kv-resident
-like the other formats. KNOWN ISSUE: the conversation cache's park/restore (A/B/A) is not yet
-bit-exact under this format - the restored continuation drifts (slot save/restore IS bit-exact, and
-needle quality is unaffected); until it is fixed, prefer `--kv q4_0` or INT8 when the conversation
-cache's checkpoint reuse matters. Details: `bench/needle-nvfp4.json`, `src/kernels/kv_nf4_parity.cpp`.
+RN-division and the [2^-9, 448] scale clamp, so host and device quantize bit for bit alike; the
+nibbles pack adjacent PAIRS - byte m holds elements 2m and 2m+1 - which is the order
+mma.m16n8k64.mxf4nvf4 fragments take, so the pool loads into them without a repack; NInfer's cache
+splits the pair (j, j+8) but its own MMA quantizer packs pairs the same way this does). 576 B per
+cell and layer - q4_0's bytes - but with twice the scale granularity: 6,912 B per token against
+INT8's 12,672 (-45%). At 128K context that is 0.88 GB of KV against INT8's 1.62 GB; the freed VRAM
+goes to expert slots.
+
+On sm_120a (RTX 50) the prompt path's Q.K^T runs on the native FP4 tensor cores (mode 6,
+qsa_prompt_attn.cu): `mma.sync.kind::mxf4nvf4.m16n8k64` with E2M1 on both sides and ue4m3 block
+scales - the K pool's code bytes ARE the B operand and its 16 scale bytes ARE the four SFB words
+(one per 64-dim k chunk), and Q is quantized online per (head, 16 dims) into a hi half plus a lo
+residual half (the fp16 kernels' hi/lo trick at 4 bits). A 16x8x256 tile costs 8 such MMAs where
+the fp16 path needs 32 m16n8k16, and the FP4 rate is twice the FP16 one. The V side cannot ride
+the instruction - block scales vary along k only, and V's scales are per cell while P.V reduces
+over cells (vLLM #50416 declined native FP4 P.V for exactly this reason), so P.V keeps the exact-
+fp16-code path with V's scales folded into P; V's nibbles LUT straight out of the cp.async staging
+through a shared-memory table (a local array lands in local memory there - measured 96 B of stack
+and an 11x slowdown of the loop). STRATA_PROMPT_ATTN_NF4=0 is the mode-5 control (NInfer's
+doubled-E2M1-to-INT8 trick; 16K prompt 291 tok/s against INT8's 336 on an RTX 5090 Laptop, the
+fallback decode kernel 189). The kernel needs the 120a build target (CMake defines
+STRATA_CUDA_ARCH_SPECIFIC; plain sm_120 keeps mode 5) - the microtest of the instruction itself,
+against a CPU reference on exact power-of-two scales, is tools/nf4_mma_probe.cu. Q in FP4 costs
+~2% of the output scale against raw-fp32 Q on synthetic pools (the parity harness pins the kernel
+to its own quantized semantics at 2e-6 and prints the raw-Q gap); quality is gated by the needle
+bench end to end. Needle 16K at depths 10/50/90: 3/3 found, the same as INT8.
+
+The kernel runs under `--kv-resident` like any format: the prompt-attention kernel reads a
+32K-context, 2048-query chunk in 7.2 ms against mode 5's 13.6 and the INT8 kernel's 5.5, and a
+short-context one (1500 cells) in 2.0 ms against INT8's 1.7-4.3 (clock-dependent); end to end the
+14.4K-token prompt benchmarks at INT8's level (2061 against 2125 tok/s cold-start, 2700 warm) with
+needle 32K at depths 10/50/90 found 3/3 and the factual battery intact. STRATA_NF4_PV8=1 swaps the
+P.V half onto `kind::f8f6f4` (P in E4M3 hi + lo, V's E2M1 codes in bits [5:2] of a byte each -
+tools/f8f6f4_probe.cu pins the containers and fragments): twice the MMA rate and a quarter of the
+instructions, but measured EVEN with the fp16 path (7.19 against 7.22 ms per 32K chunk) - the e4m3
+A-build's folds and cvts eat the win - so it stays opt-in; =2 (hi only) is faster still but costs
+12% of the output scale.
+
+The v1 append kernels wrote the DEVICE pools at the row ((pos/page)*kv_heads + h)*page + pos%page -
+the LOGICAL row, right for the host copy and the identity table of a resident session, wrong for
+the ring of `--kv-resident` and the MTP drafter's window ring, whose tables map a page to a SLOT:
+past the ring's capacity those writes ran off the pool's end (an illegal access that surfaced one
+to two layers later in verify, anywhere between "layer 3" and "mtp draft" depending on timing -
+looks like a race, is not one; STRATA_KV_RING_OFF/MAIN_OFF hid it only by removing the rings).
+Fixed to q4's own two-row form (slot row for the pools, logical row for the host copy), and
+kv_nf4_parity grew a shuffled-table append test so the two rows can never silently coincide again.
+KNOWN ISSUE: the conversation cache's park/restore (A/B/A) is not yet bit-exact under
+this format - the restored continuation drifts (slot save/restore IS bit-exact, and needle
+quality is unaffected); until it is fixed, prefer `--kv q4_0` or INT8 when the conversation
+cache's checkpoint reuse matters. Details: `bench/needle-nvfp4.json`, `src/kernels/kv_nf4_parity.cpp`,
+`src/kernels/qsa_prompt_attn_parity.cpp`.
 
 **Half-precision GDN state (opt-in, `--gdn-f16` / `STRATA_GDN_F16=1`):** the gated delta-net's recurrent
 state is 128 x 48 x 128 elements per layer, 36 layers: 113.2 MB per sequence in F32. This switch stores it as
