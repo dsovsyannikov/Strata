@@ -1,6 +1,7 @@
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nf4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 
 #include <cuda_runtime.h>
@@ -44,6 +45,11 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
         r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
+        r.n = 2;
+    } else if (fmt == kKvNvfp4) {   // the same two runs at nf4's 144 B per row (a multiple of 16)
+        const int bytes = rows * (int) kv_nf4_bytes_per_head((int) s.head_dim);
+        r.src[0] = (const uint8_t*) host.k_nf4; r.dst[0] = (uint8_t*) slots.k_nf4; r.len[0] = bytes;
+        r.src[1] = (const uint8_t*) host.v_nf4; r.dst[1] = (uint8_t*) slots.v_nf4; r.len[1] = bytes;
         r.n = 2;
     } else if (fmt == kKvInt8) {
         const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
@@ -202,6 +208,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 +
                rows * kv_q4_bytes_per_head((int) s.head_dim);
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
+    if (fmt == kKvNvfp4) return rows * kv_nf4_bytes_per_head((int) s.head_dim) * 2;
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }

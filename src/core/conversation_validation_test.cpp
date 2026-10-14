@@ -51,15 +51,17 @@ struct Pools {
     std::array<std::vector<uint8_t>, 8> data;
     Pools(const ModelGeometry& g, int format) {
         st.max_cells = 96; st.n_pages = st.n_slots = 24; st.idx_pooled_rows = 26;
-        st.kv_int8 = format == 1; st.kv_q4 = format == 2;
-        const size_t per = format == 2 ? strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                                      : g.head_dim * (format == 1 ? 1 : 2);
+        st.kv_int8 = format == 1; st.kv_q4 = format == 2; st.kv_nf4 = format == 4;
+        const size_t per = format == 4 ? strata::kernels::kv_nf4_bytes_per_head((int) g.head_dim)
+                          : format == 2 ? strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                                        : g.head_dim * (format == 1 ? 1 : 2);
         data[0].resize(96 * g.n_head_kv * per, 0xa5); data[1] = data[0];
         data[2].resize(format == 1 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5); data[3] = data[2];
         data[4].resize(26 * g.idx_key_dim * 4, 0xa5);
         data[5].resize(3 * g.idx_key_dim * 4, 0xa5);
         data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].resize(4, 0xa5);
-        if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
+        if (format == 4) { st.k_nf4 = data[0].data(); st.v_nf4 = data[1].data(); }
+        else if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
         else if (format == 1) {
             st.k_q = (int8_t*) data[0].data(); st.v_q = (int8_t*) data[1].data();
             st.k_scale = (uint16_t*) data[2].data(); st.v_scale = (uint16_t*) data[3].data();
@@ -243,7 +245,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
 }
 
 int main() {
-    for (int format : {0,1,2}) for (int experts : {256,512})
+    for (int format : {0,1,2,4}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }
