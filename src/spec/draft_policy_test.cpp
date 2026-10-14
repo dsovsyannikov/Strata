@@ -161,6 +161,32 @@ int main() {
         fresh.observe_committed(true, 6, 5, 40);
         check(fresh.choose(4, 5, 40).lookup && fresh.choose(4, 5, 40).t == 6,
               "delayed: a held time does not count as another probe");
+        // STRATA_SPEC_ADAPT's best_depth: cold start keeps the cap, the measured best depth wins, a few
+        // hot rounds deeper do not flip the incumbent, and the cap is never exceeded
+        DraftPolicy p(6);
+        check(p.best_depth(6) == 6, "adapt: cold start keeps the deepest window");
+        check(p.best_depth(1) == 1, "adapt: a cap of one stays one");
+        // committed tokens plateau at 3 while every extra row costs: r(t) = min(t,3)/cost(t) peaks at t=3
+        for (int t = 2; t <= 6; ++t)
+            for (int i = 0; i < 20; ++i) p.observe(false, t, std::min(t - 1, 2), 0, cost(t));
+        int d = 0;
+        for (int i = 0; i < 10; ++i) d = p.best_depth(6);
+        check(d == 3, "adapt: the measured best depth wins (3 over 4-6)");
+        for (int i = 0; i < 5; ++i) p.observe(false, 4, 3, 0, cost(4));   // a hot stretch at 4
+        check(p.best_depth(6) == 3, "adapt: a few hot rounds deeper do not flip the incumbent");
+        check(p.best_depth(9) <= 8, "adapt: never beyond the window cap");
+    }
+    {
+        // as choose(): a wider size whose cost is only guessed is probed, not vetoed - the cap is the only
+        // thing that feeds the sizes above the incumbent (min_p shrinks windows below it on its own)
+        DraftPolicy p(6);
+        for (int i = 0; i < 30; ++i) p.observe(false, 3, 2, 0, cost(3));   // a strong size-3 MTP
+        int d = 0;
+        for (int i = 0; i < 10; ++i) d = p.best_depth(3);
+        check(d == 3, "adapt: settles at the measured best");
+        check(p.best_depth(6) == 6, "adapt: a wider unmeasured cap is probed, not guessed away");
+        p.observe(false, 6, 1, 0, 4.0 * cost(6));   // the probe: the wide window turns out very expensive
+        check(p.best_depth(6) < 6, "adapt: after the probe, the measured cost decides");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

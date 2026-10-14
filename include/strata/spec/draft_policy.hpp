@@ -94,6 +94,14 @@ public:
     void observe_probs(const float* p, int n_window_drafts, int accepted);
     double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
 
+    /// STRATA_SPEC_ADAPT=1: the MTP window cap for the next round - the size with the best expected committed
+    /// tokens per ms in [1, t_max], over the same measured costs and token EMAs `choose` compares. Cold start
+    /// keeps the cap (the priors favor depth); `choose`'s rules carry over: a size above the incumbent that was
+    /// measured fewer than kProbes times is tried (min_p shrinks windows below the cap on its own, so only the
+    /// cap keeps the large sizes fed), and a size not measured for a long stretch gets one cheap re-look. The
+    /// incumbent only moves when a challenger beats it by `margin`, so one good round does not flip it.
+    int best_depth(int t_max);
+
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
@@ -117,6 +125,7 @@ private:
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> delayed_n_{};  // of cost_n_: times applied by apply_costs (not new probes)
     struct HeldCost { int64_t end; int bucket; int t; double ms; };
     std::vector<HeldCost> held_;                                          // defer_cost, oldest first
+    int incumbent_ = 0;                                    // best_depth's last answer (0 = none yet)
 };
 
 }  // namespace strata::spec
