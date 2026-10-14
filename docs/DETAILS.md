@@ -94,6 +94,22 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**NVFP4 KV cache (opt-in, `--kv nvfp4`):** K and V of the twelve QSA layers stored as NVFP4 - 4-bit
+E2M1 codes with one 8-bit E4M3 scale per group of 16 - after the same Walsh-Hadamard rotation as
+`--kv q4_0` (kv_nf4.hpp; the codec transcribes NInfer's `nvfp4_group16_codec.cuh`, including its
+RN-division and the [2^-9, 448] scale clamp, so host and device quantize bit for bit alike).
+576 B per cell and layer - q4_0's bytes - but with twice the scale granularity: 6,912 B per token
+against INT8's 12,672 (-45%). At 128K context that is 0.88 GB of KV against INT8's 1.62 GB; the
+freed VRAM goes to expert slots. The prompt path keeps NInfer's speed trick: the doubled E2M1
+magnitudes {0,.5,1,1.5,2,3,4,6}x2 are exact INT8 codes, so `qsa_prompt_attn` runs them through the
+INT8 tensor cores with the halved E4M3 scale per 16 (mode 5, q4_0's mode 4 at a finer group); a
+16K prompt reads at 291 tok/s against INT8's 336 on an RTX 5090 Laptop (the fallback decode kernel
+did 189). Needle 16K at depths 10/50/90: 3/3 found, the same as INT8. Streams with --kv-resident
+like the other formats. KNOWN ISSUE: the conversation cache's park/restore (A/B/A) is not yet
+bit-exact under this format - the restored continuation drifts (slot save/restore IS bit-exact, and
+needle quality is unaffected); until it is fixed, prefer `--kv q4_0` or INT8 when the conversation
+cache's checkpoint reuse matters. Details: `bench/needle-nvfp4.json`, `src/kernels/kv_nf4_parity.cpp`.
+
 **Half-precision GDN state (opt-in, `--gdn-f16` / `STRATA_GDN_F16=1`):** the gated delta-net's recurrent
 state is 128 x 48 x 128 elements per layer, 36 layers: 113.2 MB per sequence in F32. This switch stores it as
 IEEE binary16 - 56.6 MB - while every kernel keeps its arithmetic in F32 (an element widens on load, narrows on

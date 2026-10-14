@@ -27,6 +27,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nf4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -885,6 +886,9 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     } else if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_nf4) {
+        st.k_nf4 = o.take<uint8_t>(rows * strata::kernels::kv_nf4_bytes_per_head((int) s.head_dim), ok);
+        st.v_nf4 = o.take<uint8_t>(rows * strata::kernels::kv_nf4_bytes_per_head((int) s.head_dim), ok);
     } else if (q0.kv_int8) {
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
@@ -899,6 +903,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    p.k_nf4 = h.k_nf4; p.v_nf4 = h.v_nf4;
     p.page_table = table;
     return p;
 }
@@ -1492,7 +1497,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
-        if (st.kv_q4) {
+        if (st.kv_nf4) {
+            strata::kernels::kv_append_nf4(st.k_nf4, st.v_nf4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host,
+                                           nullptr);
+        } else if (st.kv_q4) {
             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
@@ -2693,7 +2701,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         }
-                        if (st.kv_q4)
+                        if (st.kv_nf4)
+                            strata::kernels::kv_append_nf4(st.k_nf4, st.v_nf4, st.page_table, p0, T, m.Kc, m.Vc, s,
+                                                           m.cs, host_w, staged ? &m.stage : nullptr);
+                        else if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                           host_w, staged ? &m.stage : nullptr);
                         else

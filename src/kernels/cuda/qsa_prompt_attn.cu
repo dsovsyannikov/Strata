@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_nf4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -85,10 +86,12 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
 template <int KV_MODE>
 struct Smem {
     using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4, int8_t, __half>::type;
+    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4 || KV_MODE == 5, int8_t, __half>::type;
     static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
+    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4 || KV_MODE == 5) ? HD + 16 : HD + 8;
+    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0                    // q4_0: 8 groups of 32
+                          : KV_MODE == 5 ? HD / NF4_GROUP                   // nvfp4: 16 groups of 16
+                                         : 4;                              // int8: 4 of 64
     __half qh[16][QS];
     __half ql[16][QS];
     KElem k[CH][KROW];
@@ -159,7 +162,46 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
         __syncthreads();   // rows ready; the previous chunk's p.v is done with k, v, s
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
         // and their scales
-        if constexpr (KV_MODE == 4) {
+        if constexpr (KV_MODE == 5) {
+            // nvfp4 K and V (kv_nf4.hpp): one (K or V, cell, GROUP of 16) per item - the group's 8 code bytes
+            // become 16 exact int8 codes through the doubled-E2M1 LUT ({0,.5,1,1.5,2,3,4,6} * 2 are integers),
+            // and its E4M3 scale, halved for the doubled codes, goes to ks/vs as a float - NInfer's own trick
+            // for keeping FP4 KV on the INT8 tensor cores (nvfp4_group16_codec.cuh dequantizes to half2 the
+            // same way)
+            constexpr int GRP = HD / NF4_GROUP;                   // 16
+            for (int i = t; i < 2 * CH * GRP; i += THREADS) {
+                const int kv = i / (CH * GRP), rem = i % (CH * GRP), c = rem / GRP, g = rem % GRP;
+                const long long r = S.row[c];
+                uint4 w = make_uint4(0, 0, 0, 0);
+                float d = 0.0f;
+                if (r >= 0) {
+                    constexpr int bytes_per_head = (int) sizeof(block_nf4);
+                    const block_nf4* blk =
+                        reinterpret_cast<const block_nf4*>((kv == 0 ? p.k_nf4 : p.v_nf4) + r * bytes_per_head);
+                    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk->qs + g * (NF4_GROUP / 2));
+                    uint32_t ww[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        ww[j] = (uint32_t) __ldg(q16 + 2 * j) | ((uint32_t) __ldg(q16 + 2 * j + 1) << 16);
+                    w = make_uint4(ww[0], ww[1], ww[2], ww[3]);
+                    d = 0.5f * nf4_e4m3_decode(__ldg(&blk->sc[g]));
+                }
+                // doubled E2M1 magnitudes by code index; the sign bit is the code's bit 3
+                constexpr int8_t lut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, (int8_t) -1, (int8_t) -2, (int8_t) -3,
+                                            (int8_t) -4, (int8_t) -6, (int8_t) -8, (int8_t) -12};
+                int8_t codes[16];
+                const uint8_t* wb = reinterpret_cast<const uint8_t*>(&w);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    codes[j] = lut[wb[j] & 0x0F];          // element j: the low nibble of byte j
+                    codes[j + 8] = lut[wb[j] >> 4];        // element j + 8: the high nibble
+                }
+                int8_t* dst = kv == 0 ? &S.k[c][g * NF4_GROUP] : &S.v[c][g * NF4_GROUP];
+#pragma unroll
+                for (int j = 0; j < 16; ++j) dst[j] = codes[j];
+                (kv == 0 ? S.ks : S.vs)[c][g] = d;
+            }
+        } else if constexpr (KV_MODE == 4) {
             // q4_0 K and V: one (K or V, cell, block) per item - the block's 16 code bytes (2-byte aligned: eight
             // 16-bit loads) become 32 exact int8 codes (element j in the low nibble of byte j, j + 16 in the high
             // one), its fp16 scale goes to ks/vs
@@ -1493,6 +1535,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+    if (pools.k_nf4 != nullptr) {   // NVFP4 K and V (--kv nvfp4): mode 5, mode 4's int8-codes trick at a
+        // scale per 16 (kv_nf4.hpp); Turing and older fall back to the decode kernel (qsa_decode_attn_batch)
+        if (turing || pools.v_nf4 == nullptr) return false;
+        return launch<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
         static const bool q4_off = [] {
             const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
