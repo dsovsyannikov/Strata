@@ -9160,12 +9160,21 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        const int S_mtp_cap = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        int S_mtp = S_mtp_cap;   // STRATA_SPEC_ADAPT=1 narrows this per round (policy.best_depth)
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // STRATA_SPEC_ADAPT=1: per round the policy narrows the MTP cap to the window size with the best measured
+        // committed-tokens-per-ms (SGLang's MTP serving data: depth 4 buys little over 3, and a text whose drafts
+        // die early pays for rows it never accepts).  The output is unchanged: it only bounds how deep the drafter
+        // may go; verification still commits exactly the target's tokens.  The pipelined path keeps the full cap.
+        static const bool spec_adapt = [] {
+            const char* v = std::getenv("STRATA_SPEC_ADAPT");
+            return v != nullptr && v[0] == '1';
+        }();
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -11237,6 +11246,8 @@ int main(int argc, char** argv) {
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
+            int64_t depth_pick[9] = {};                 // STRATA_SPEC_ADAPT=1: rounds spent at each chosen cap
+            int64_t win_all = 0, win_full = 0;          // windows seen / fully accepted (the defer gate's inputs)
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
@@ -11923,6 +11934,11 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                if (spec_adapt && use_mtp && !first_window) {   // STRATA_SPEC_ADAPT: the round's cap
+                    S_mtp = policy.best_depth(S_mtp_cap);
+                    mtp.set_max_drafts(S_mtp - 1);
+                    ++depth_pick[std::min(S_mtp, 8)];
+                }
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -12036,8 +12052,13 @@ int main(int argc, char** argv) {
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
+                if (!from_sfx && !first_window) {
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                    // STRATA_SPEC_ADAPT's deferred-state-write gate: how many windows accept every drafted
+                    // row (the commit's GDN replay would be skippable there) and what commit costs overall
+                    ++win_all;
+                    win_full += a >= T_mtp - 1;
+                }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
@@ -12491,11 +12512,26 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);
-            if (std::getenv("STRATA_SPEC_DEPTH") != nullptr)
+            if (std::getenv("STRATA_SPEC_DEPTH") != nullptr) {
                 std::fprintf(stderr, "strata serve: spec depth: accepted/tested %lld/%lld %lld/%lld %lld/%lld %lld/%lld %lld/%lld\n",
                              (long long) dp_ok[0], (long long) dp_tested[0], (long long) dp_ok[1], (long long) dp_tested[1],
                              (long long) dp_ok[2], (long long) dp_tested[2], (long long) dp_ok[3], (long long) dp_tested[3],
                              (long long) dp_ok[4], (long long) dp_tested[4]);
+                std::fprintf(stderr, "strata serve: spec windows: %lld of %lld fully accepted (%.1f%%), commit %.2f ms/window\n",
+                             (long long) win_full, (long long) win_all,
+                             win_all ? 100.0 * (double) win_full / (double) win_all : 0.0,
+                             dec_windows > 0 ? ver.ms_commit / (double) dec_windows : 0.0);
+            }
+            if (spec_adapt) {
+                std::string picks;
+                char b[32];
+                for (int t = 1; t <= 8; ++t)
+                    if (depth_pick[t] > 0) {
+                        std::snprintf(b, sizeof b, " %d:%lld", t, (long long) depth_pick[t]);
+                        picks += b;
+                    }
+                std::fprintf(stderr, "strata serve: spec adapt: rounds at each cap:%s\n", picks.c_str());
+            }
             if (strata::core::MtpDrafter::top2_env())
                 std::fprintf(stderr, "strata serve: mtp top2: rejected/runner-up by depth %lld/%lld %lld/%lld %lld/%lld %lld/%lld "
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
@@ -13105,8 +13141,14 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        const int S_mtp_cap = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        int S_mtp = S_mtp_cap;   // STRATA_SPEC_ADAPT=1 narrows this per round (policy.best_depth)
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        // as the serve loop's flag: the policy narrows the MTP cap to the best paid depth; output unchanged
+        static const bool spec_adapt = [] {
+            const char* v = std::getenv("STRATA_SPEC_ADAPT");
+            return v != nullptr && v[0] == '1';
+        }();
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
@@ -13128,6 +13170,10 @@ int main(int argc, char** argv) {
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
+            if (spec_adapt && use_mtp) {   // STRATA_SPEC_ADAPT: the round's cap (a cold policy keeps the full cap)
+                S_mtp = policy.best_depth(S_mtp_cap);
+                mtp.set_max_drafts(S_mtp - 1);
+            }
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;

@@ -46,6 +46,14 @@ public:
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
+    /// STRATA_SPEC_ADAPT=1: the MTP window cap for the next round - the size with the best expected committed
+    /// tokens per ms in [1, t_max], over the same measured costs and token EMAs `choose` compares. Cold start
+    /// keeps the cap (the priors favor depth); `choose`'s rules carry over: a size above the incumbent that was
+    /// measured fewer than kProbes times is tried (min_p shrinks windows below the cap on its own, so only the
+    /// cap keeps the large sizes fed), and a size not measured for a long stretch gets one cheap re-look. The
+    /// incumbent only moves when a challenger beats it by `margin`, so one good round does not flip it.
+    int best_depth(int t_max);
+
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
@@ -59,6 +67,7 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
+    int incumbent_ = 0;                                    // best_depth's last answer (0 = none yet)
 };
 
 }  // namespace strata::spec

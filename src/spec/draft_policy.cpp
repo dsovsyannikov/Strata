@@ -158,4 +158,25 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     cbad_[b] = kDecay * cbad_[b] + (ok < k ? 1.0 : 0.0);
 }
 
+int DraftPolicy::best_depth(int t_max) {
+    t_max = std::clamp(t_max, 1, max_t_);
+    if (t_max <= 1) return 1;
+    if (incumbent_ < 1 || incumbent_ > t_max) incumbent_ = t_max;   // cold start: the priors favor depth
+    // as choose(): a size whose cost is only guessed is measured, not vetoed - and only the cap can feed the
+    // sizes above the incumbent, because min_p already shrinks windows below it on its own
+    for (int t = t_max; t > incumbent_; --t)
+        if (cost_n_[t] < kProbes) { incumbent_ = t; return t; }
+    const double r_inc = mtp_tokens(incumbent_) / cost_ms(incumbent_);
+    int best = incumbent_;
+    double r_best = r_inc;
+    for (int t = 1; t <= t_max; ++t) {
+        if (t == incumbent_) continue;
+        double r = mtp_tokens(t) / cost_ms(t);
+        if (stale(t)) r *= 1.0 + margin_;   // a long-unmeasured size could have changed: one cheap re-look
+        if (r > r_best * (1.0 + margin_)) { r_best = r; best = t; }
+    }
+    incumbent_ = best;
+    return best;
+}
+
 }  // namespace strata::spec

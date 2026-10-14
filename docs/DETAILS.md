@@ -191,6 +191,21 @@ drafts accepted 52.8% -> 59.9%, tokens per verify window 2.65 -> 2.88, output 41
 costs the same (draft 8.8 -> 9.1 ms of 64). `sampler_parity` checks the pick against a host reference on every sampled
 path, and that its frequencies match the softmax. On an RTX 3060 (IQ3_XXS, `--spec 4 --mtp`, temperature 1.0 / top_p 0.95 / top_k 20, 12 interleaved pairs of 200-token story and code requests) `STRATA_SPEC_COUPLED=1` raised the accepted drafts from 62.1% to 66.9% and adding `STRATA_SPEC_GUMBEL=1` to 68.0%, but decode speed did not move beyond the run-to-run spread (median 43.3 tok/s with coupled alone, 42.8 with Gumbel as well): try it on your own card before relying on it.
 
+**Adaptive MTP depth (opt-in, `STRATA_SPEC_ADAPT=1`, fork):** per round, `DraftPolicy::best_depth` narrows the MTP
+window cap to the size with the best measured committed-tokens-per-ms - the same cost and token EMAs `choose` already
+keeps for the MTP-vs-lookup decision, with `choose`'s rules carried over (kProbes tries of an unmeasured size, a stale
+size re-looked at, an incumbent that only moves when a challenger beats it by the margin). All verify graphs for
+T <= `--spec` are captured up front and `set_max_drafts` is a free inline setter, so nothing is re-captured; the output
+cannot change (the cap only bounds how deep the drafter may go). `STRATA_SPEC_DEPTH=1` additionally prints a
+`spec adapt: rounds at each cap` histogram per request and a `spec windows: N of M fully accepted, commit X ms/window`
+line. Measured on the fork's RTX 5090 Laptop bench (IQ3_XXS, `--spec 4 --spec-min-p 0.5`, two interleaved A/B rounds,
+three prompts x two passes at temperature 0): the policy keeps depth 4 wherever drafts pay (code, 80% accepted) and
+briefly drops to 3 on the low-acceptance Russian text (38-48% accepted); decode is +0.8% on code/English and +3.2% on
+Russian (fewer wasted draft steps at the same acceptance), so it stays opt-in. The same run pinned the
+deferred-GDN-write idea (skip the commit replay on fully accepted windows - the one ReplaySSM trick the engine did not
+already have): 60-85% of windows do fully accept, but the whole commit graph costs only 0.07-0.36 ms of a 25-30 ms
+window, so skipping it cannot buy more than ~0.3% - measured and dropped, not worth a pending-input ring.
+
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
 token (106,299 ids), so answers in those languages are 15-38% faster (Q2_0, RTX 5070). Its head takes ~180 MiB of
