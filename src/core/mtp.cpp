@@ -332,10 +332,25 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
     // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+    // The 4-bit formats keep the drafter's K/V at plain INT8 (the k8v4 form, now the DEFAULT): the draft
+    // proposals read this one layer's whole context, and its 4-bit noise at long contexts costs more MTP
+    // acceptance than the single layer's KV saves memory - at 158K, drafts accepted 59% vs 83% with the
+    // drafter at nvfp4, decode -15..20%; back at INT8 it measured 79.2 against int8-everything's 81.1 tok/s,
+    // for ~480 B/token more (a 0.5 pp expert hit-rate shift). The 12 main layers keep the compact format.
+    // STRATA_MTP_KV8=0 restores the drafter-follows-the-format behaviour. A session saved with the
+    // drafter at 4 bits fails restore loudly (conversation_kv_validate: bytes differ), it does not corrupt.
+    static const bool kv8_off = [] { const char* v = std::getenv("STRATA_MTP_KV8"); return v != nullptr && std::atoi(v) == 0; }();
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
+    const bool kv_q4_was = qsa_kv_q4();
+    const bool kv_nf4_was = qsa_kv_nf4();
+    const bool drafter_int8 = kv_hybrid_was || ((kv_q4_was || kv_nf4_was) && !kv8_off);
     qsa_set_kv_hybrid(false);
-    if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    if (drafter_int8) {   // the drafter under --kv k8v4 (and the 4-bit formats): plain INT8
+        qsa_set_kv_int8(true);
+        qsa_set_kv_q4(false);
+        qsa_set_kv_nf4(false);
+    }
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -351,6 +366,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_q4(kv_q4_was);
+    qsa_set_kv_nf4(kv_nf4_was);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
