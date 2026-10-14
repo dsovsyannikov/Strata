@@ -12468,16 +12468,21 @@ int main(int argc, char** argv) {
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 // (this device's owned ordinals; a split's other stages hold theirs)
-                uint64_t miss = 0, look = 0;
+                uint64_t miss = 0, look = 0, bytes = 0;
                 bool over = false;
                 for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
                     const strata::kernels::KvStreamCounters c =
                         strata::kernels::kv_stream_counters(ss.qsa_states[ss.qsa_ord0 + j].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
+                    // the block size is the state's own format's (4224 B INT8, 2304 NVFP4): a single
+                    // hardcoded 4224 overstated NVFP4's RAM traffic by 1.83x
+                    bytes += c.misses * strata::kernels::kv_block_bytes(
+                                                     strata::kernels::qsa_real_shapes(),
+                                                     strata::core::qsa_kv_format(ss.qsa_states[ss.qsa_ord0 + j]));
                 }
                 std::fprintf(stderr, "strata serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
                                      "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
-                             (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
+                             (unsigned long long) look, (double) bytes / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
             }
             if (sfx_windows > 0)
