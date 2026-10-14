@@ -47,9 +47,11 @@ __global__ void kv_append_nf4_kernel(uint8_t* __restrict__ k_nf4, uint8_t* __res
 #pragma unroll
     for (int i = 0; i < NF4_GROUP; ++i) x[i] = src[i];
     const long long page = (long long) table[pos / page_size];
-    const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, row, g, x);
-    if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, row, g, x);
+    const long long host_row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    // the pools hold SLOT rows (a ring or a streamed ring table maps the page), the host copy logical ones
+    if (page >= 0)
+        nf4_group_store(is_v ? v_nf4 : k_nf4, (page * kv_heads + h) * page_size + (pos % page_size), g, x);
+    if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, host_row, g, x);
 }
 
 // The prompt path: grid (T, kv_heads * 2); also into the staging pool (identity layout) when given.
@@ -67,7 +69,7 @@ __global__ void kv_append_nf4_batch_kernel(uint8_t* __restrict__ k_nf4, uint8_t*
     for (int i = 0; i < NF4_GROUP; ++i) x[i] = src[i];
     const long long page = (long long) table[pos / page_size];
     const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, row, g, x);
+    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, (page * kv_heads + h) * page_size + (pos % page_size), g, x);
     if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, row, g, x);
     if (stage.k_nf4 != nullptr) nf4_group_store(is_v ? stage.v_nf4 : stage.k_nf4, row, g, x);
 }
@@ -92,13 +94,13 @@ __global__ void kv_gather_nf4_kernel(const uint8_t* __restrict__ k_nf4, const ui
     const float vs = nf4_e4m3_decode(vb->sc[g]);
     const long long dst = ((id * kv_heads + h) * head_dim) + g * NF4_GROUP;
 #pragma unroll
-    for (int i = 0; i < NF4_GROUP / 2; ++i) {
+    for (int i = 0; i < NF4_GROUP / 2; ++i) {   // element 2i: byte i's low nibble; 2i+1: its high nibble
         const uint8_t kbyte = kb->qs[g * (NF4_GROUP / 2) + i];
         const uint8_t vbyte = vb->qs[g * (NF4_GROUP / 2) + i];
-        k_scratch[dst + i] = f16_from_f32(nf4_e2m1_decode(kbyte & 0x0F) * ks);
-        k_scratch[dst + i + NF4_GROUP / 2] = f16_from_f32(nf4_e2m1_decode(kbyte >> 4) * ks);
-        v_scratch[dst + i] = f16_from_f32(nf4_e2m1_decode(vbyte & 0x0F) * vs);
-        v_scratch[dst + i + NF4_GROUP / 2] = f16_from_f32(nf4_e2m1_decode(vbyte >> 4) * vs);
+        k_scratch[dst + 2 * i] = f16_from_f32(nf4_e2m1_decode(kbyte & 0x0F) * ks);
+        k_scratch[dst + 2 * i + 1] = f16_from_f32(nf4_e2m1_decode(kbyte >> 4) * ks);
+        v_scratch[dst + 2 * i] = f16_from_f32(nf4_e2m1_decode(vbyte & 0x0F) * vs);
+        v_scratch[dst + 2 * i + 1] = f16_from_f32(nf4_e2m1_decode(vbyte >> 4) * vs);
     }
 }
 

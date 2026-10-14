@@ -110,6 +110,48 @@ int run() {
     std::printf("  %-44s %zu of 2048 blocks differ\n", "append bytes vs host reference", block_diffs);
     std::printf("  %-44s %zu of 64 cells differ\n", "batched steps vs per-cell (bitwise)", cell_diffs);
     std::printf("  %-44s %.3e worst, %.3e mean\n", "decoded value vs reference", worst, sum_rel / (double) value_checks);
+
+    {   // a RING-style table (page -> a shuffled slot): the pools hold SLOT rows, the host copy logical
+        // ones - the identity table above cannot tell the two apart (v1's append wrote logical rows into
+        // the pools and only the ring's overflow crash caught it)
+        std::vector<int32_t> rtable((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) rtable[(size_t) i] = (int32_t) ((i * 7 + 3) % pages);
+        uint8_t *rk = nullptr, *rv = nullptr;
+        int32_t* rt = nullptr;
+        cudaMalloc(&rk, pool_bytes); cudaMalloc(&rv, pool_bytes);
+        cudaMalloc(&rt, rtable.size() * 4);
+        cudaMemcpy(rt, rtable.data(), rtable.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemset(rk, 0xA5, pool_bytes); cudaMemset(rv, 0x5A, pool_bytes);
+        strata::kernels::KvHostPools host;
+        std::vector<uint8_t> hk(pool_bytes, 0), hv(pool_bytes, 0);
+        uint8_t *dhk = nullptr, *dhv = nullptr;
+        cudaMalloc(&dhk, pool_bytes); cudaMalloc(&dhv, pool_bytes);
+        cudaMemset(dhk, 0, pool_bytes); cudaMemset(dhv, 0, pool_bytes);
+        host.k_nf4 = dhk; host.v_nf4 = dhv;
+        kv_append_nf4_steps(rk, rv, rt, steps_dev, 8, (int) cells, kcur_dev, vcur_dev, kShapes, nullptr, &host);
+        cudaDeviceSynchronize();
+        std::vector<uint8_t> rgot(pool_bytes), hgot(pool_bytes);
+        cudaMemcpy(rgot.data(), rk, pool_bytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hgot.data(), dhk, pool_bytes, cudaMemcpyDeviceToHost);
+        size_t slot_bad = 0, host_bad = 0;
+        for (int64_t c = 0; c < cells; ++c)
+            for (int h = 0; h < kShapes.n_head_kv; ++h) {
+                const int64_t sl = rtable[(size_t) (c / kShapes.page_size)];
+                const size_t srow = (size_t) ((sl * kShapes.n_head_kv + h) * kShapes.page_size + (c % kShapes.page_size));
+                const size_t lrow = (size_t) (((c / kShapes.page_size) * kShapes.n_head_kv + h) * kShapes.page_size + (c % kShapes.page_size));
+                if (std::memcmp(rgot.data() + srow * sizeof(block_nf4), k_host.data() + lrow * sizeof(block_nf4),
+                                sizeof(block_nf4)) != 0) ++slot_bad;
+                if (std::memcmp(hgot.data() + lrow * sizeof(block_nf4), k_host.data() + lrow * sizeof(block_nf4),
+                                sizeof(block_nf4)) != 0) ++host_bad;
+            }
+        // a wrong row formula also lands past a ring pool smaller than the context - the engine caught
+        // that one as an illegal access before this test existed
+        CK(slot_bad == 0);
+        CK(host_bad == 0);
+        std::printf("  %-44s %zu cell rows wrong (host %zu)\n", "ring-table append: slot vs logical rows", slot_bad,
+                    host_bad);
+        cudaFree(rk); cudaFree(rv); cudaFree(rt); cudaFree(dhk); cudaFree(dhv);
+    }
     const int64_t n_ids = 32;
     std::vector<int32_t> ids((size_t) n_ids);
     for (int64_t i = 0; i < n_ids; ++i) ids[(size_t) i] = (int32_t) (i * 2);
