@@ -87,6 +87,313 @@ the CPU does not have to compute. `tools/make_profile.py` builds an expert profi
 once with `--dump-routing trace.bin`, then see the tool's help. The shipped profile ranks every expert pair, so a trace
 changes the order only with `--reorder` (your trace's pairs first, then the base's, then the rest).
 
+IQ3_XXS and IQ3_S at 262K are not measured: with their 43 / 50 GB of experts, a 260K-token context brings a 64 GB PC
+to its memory limit by setup's estimate (the experts + the context's KV cache + 24 GB), so setup recommends up to 128K
+with them on 64 GB. A longer context you choose (`--context 262144`, or a pick in its list) is kept, with a note: users
+ran IQ3_S at 256K on 64 GB with RAM to spare (#406). In the low-RAM mode the KV cache stays in VRAM and the context
+does not count against RAM. IQ3_S (engine 0.1.4 or newer) is published for the original model and for Swift 1.5
+(the same shard layout as Swift's other sizes).
+
+**KV streaming (engine 0.1.5):** at 64K and more, setup keeps the context's KV cache in RAM and only the part the
+attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Q2_0 at 262K: 50.9 -> 62.6 tokens/s
+(1,589 -> 3,872 experts in VRAM); at 128K about +6%. The attention reads exactly the same values (only where the KV lives changes); it
+costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
+it on. Setup turns it on when the RAM has room for it; `--kv-streaming on|off` overrides that (on past the RAM test with a
+note; never under WSL, which cannot stream).
+
+**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
+halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
+is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
+Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
+
+**Hybrid K8V4 KV cache (engine 0.1.25, optional, PR #120):** `--kv k8v4` (`START-HERE.bat --setup --kv k8v4`) keeps
+the keys at 8 bits and stores the values as rotated 4-bit: 23% less KV memory than 8-bit, so more experts fit in
+VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the same needle results, prompts 2-5%
+slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
+20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
+
+**NVFP4 KV cache (opt-in, `--kv nvfp4`):** K and V of the twelve QSA layers stored as NVFP4 - 4-bit
+E2M1 codes with one 8-bit E4M3 scale per group of 16 - after the same Walsh-Hadamard rotation as
+`--kv q4_0` (kv_nf4.hpp; the codec transcribes NInfer's `nvfp4_group16_codec.cuh`, including its
+RN-division and the [2^-9, 448] scale clamp, so host and device quantize bit for bit alike).
+576 B per cell and layer - q4_0's bytes - but with twice the scale granularity: 6,912 B per token
+against INT8's 12,672 (-45%). At 128K context that is 0.88 GB of KV against INT8's 1.62 GB; the
+freed VRAM goes to expert slots. The prompt path keeps NInfer's speed trick: the doubled E2M1
+magnitudes {0,.5,1,1.5,2,3,4,6}x2 are exact INT8 codes, so `qsa_prompt_attn` runs them through the
+INT8 tensor cores with the halved E4M3 scale per 16 (mode 5, q4_0's mode 4 at a finer group); a
+16K prompt reads at 291 tok/s against INT8's 336 on an RTX 5090 Laptop (the fallback decode kernel
+did 189). Needle 16K at depths 10/50/90: 3/3 found, the same as INT8. Streams with --kv-resident
+like the other formats. KNOWN ISSUE: the conversation cache's park/restore (A/B/A) is not yet
+bit-exact under this format - the restored continuation drifts (slot save/restore IS bit-exact, and
+needle quality is unaffected); until it is fixed, prefer `--kv q4_0` or INT8 when the conversation
+cache's checkpoint reuse matters. Details: `bench/needle-nvfp4.json`, `src/kernels/kv_nf4_parity.cpp`.
+
+**Half-precision GDN state (opt-in, `--gdn-f16` / `STRATA_GDN_F16=1`):** the gated delta-net's recurrent
+state is 128 x 48 x 128 elements per layer, 36 layers: 113.2 MB per sequence in F32. This switch stores it as
+IEEE binary16 - 56.6 MB - while every kernel keeps its arithmetic in F32 (an element widens on load, narrows on
+store; the F32 path compiles to exactly the old bits, so the default is unchanged). The conv history that follows
+the recurrence in every layer block stays F32. On an RTX 5090 Laptop (24 GB, IQ3_XXS, the Coder config, 1 run of
+`tools/strata_bench.py --runs 1`): chat decode 10.8 -> 11.9 tok/s (+10%), the agent suite's decode 12.4 -> 12.9
+(+4%), prompts unchanged, the conversation cache's hit rate unchanged (68.9%). A 141-token session file shrinks
+238.3 -> 125.1 MB (-47.5%), and conversation checkpoints (each carries a full state copy) halve with it. Session
+files record the switch in their configuration fingerprint: one saved without the flag restores only into an
+engine started without it. Details: `bench/results-ram-f32` and `bench/results-ram-f16`.
+
+**Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
+expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
+slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
+at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
+conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
+every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
+-1..-3%, the other models the same; the default stays the fastest rule. On an Intel CPU of Alder Lake or later
+without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, `STRATA_IQ3S_MT1=1` (opt-in) gives IQ3_S the multi-token
+kernel for one token, which is the faster one there; it changes a lone token's rounding, so it is off by default. Through the server, two more things carry
+over from one request to the next (#410): the adaptive tier moves experts between RAM and VRAM (the GPU and the CPU
+round an expert differently), and the prompt cache resumes a repeated prompt and reads only its tail through the
+decode path. For byte-identical repeats add `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0` to the engine's args
+as well (#410): the PCIe share of the missed experts (computed on the GPU instead of the CPU) still made the first
+answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-token prompt, 4 repeats): with all
+three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
+`--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
+
+**Coupled drafts with Gumbel-max picks (opt-in, `STRATA_SPEC_COUPLED=1` and `STRATA_SPEC_GUMBEL=1`):** for a request
+that samples (temperature above 0), `STRATA_SPEC_COUPLED=1` lets the draft layer sample its guesses with the target's own
+chain and random draw instead of taking its most likely token. `STRATA_SPEC_GUMBEL=1` changes how both of them pick from
+that chain: the token with the largest p / E, where E is exponential noise keyed by the seed, the position and the token
+id (the Gumbel-max trick; it is still an exact sample of the same distribution). With the default pick, one random number
+walked over the candidates sorted by probability, a draft and a target whose candidate lists differ in one token tend to
+land on different tokens; with noise keyed by the token, a token gets the same noise on both sides, so they agree on the
+tokens they share. Greedy requests are unchanged, and without the variables nothing changes. Measured on a Ryzen AI
+Max+ 395 (Radeon 8060S, Linux, ROCm 7.14.1, the iGPU alone), UD-Q4_K_XL, `--spec 4 --mtp` (the base model's draft
+layer), temperature 1.0 / top_p 0.95 / top_k 20, a 1.3K-token prompt and 512 output tokens, 12-13 requests per arm:
+drafts accepted 52.8% -> 59.9%, tokens per verify window 2.65 -> 2.88, output 41.1 -> 44.9 tokens/s (+9%); a window
+costs the same (draft 8.8 -> 9.1 ms of 64). `sampler_parity` checks the pick against a host reference on every sampled
+path, and that its frequencies match the softmax. On an RTX 3060 (IQ3_XXS, `--spec 4 --mtp`, temperature 1.0 / top_p 0.95 / top_k 20, 12 interleaved pairs of 200-token story and code requests) `STRATA_SPEC_COUPLED=1` raised the accepted drafts from 62.1% to 66.9% and adding `STRATA_SPEC_GUMBEL=1` to 68.0%, but decode speed did not move beyond the run-to-run spread (median 43.3 tok/s with coupled alone, 42.8 with Gumbel as well): try it on your own card before relying on it.
+
+**The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
+of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
+token (106,299 ids), so answers in those languages are 15-38% faster (Q2_0, RTX 5070). Its head takes ~180 MiB of
+VRAM, which the expert cache leaves free for it (0.1.28). `START-HERE.bat --setup --draft-vocab en` keeps the
+English/code subset from before (40,525 ids, ~110 MiB less VRAM, English answers 1-2% faster; CJK answers get
+almost no drafts). `--draft-vocab cyrillic` takes the English/code subset plus the whole Cyrillic script (58,963
+ids): the shipped subsets hold 142 of the vocabulary's 18,580 Cyrillic tokens, so Ukrainian or Russian answers got
+1.4 tokens a round; with it 2.1, and 83 -> 109 tokens/s (RTX 5090, the NVFP4 fork), English unchanged.
+`--draft-vocab fr` (0.1.39, #597) takes the English/code subset plus the 5,686 tokens that cover 99% of a French
+Wikipedia corpus (46,211 ids, `tools/draft_vocab.py --corpus`): 23.6% of French text's tokens were outside the
+English/code subset, 0.7% are outside this one. Drafts accepted in French answers 0.51 -> 0.60 (IQ3_XXS, RTX 5070,
+8 prompts x 2 passes; English 0.61 -> 0.63 and code 0.77 -> 0.78, no loss), and 141 -> 158 tok/s in French on an
+RTX 5090 (IQ3_S, the reporter's measurement).
+`tools/draft_vocab.py` builds and inspects subsets. When the start stops with "the draft head does not fit" (a
+12 GB card with a long context, #474), the engine says how much the head needs, how much VRAM is free and which
+smaller subset fits, and the server's start error repeats it; setup suggests `--draft-vocab en` on cards under
+14 GB (only a suggestion: nothing changes unless you pass it).
+
+**Serving without the draft layer (`--mtp` is optional):** `serve` runs without `--mtp`. Drafts then come from the
+suffix/prompt-lookup drafter only (or one token per round), every token is still verified against the model, and the
+draft layer's VRAM (~0.7-1 GiB with its head) goes to the expert cache: 1,000 -> 1,678 slots in one A/B on an 8 GB
+card. The conversation cache (`--conversation-cache-mib`) stays on: a parked conversation then carries no draft K/V.
+
+**Low-RAM mode (engine 0.1.26, chosen by setup):** normally all of a model's experts are copied into RAM (23-50 GB,
+pinned) and the GPU holds a copy of the most-used ones. On a PC whose RAM cannot hold them beside the system (the
+experts plus ~10 GB), setup instead maps them from one file in the model's folder (`--mmap-experts`, the pack's
+`experts.bin`, +23-50 GB of disk). The OS file cache holds what the GPU does not, and it can give that memory back.
+On the Coder the engine's committed memory drops from 36 to ~13 GB, with the same answers. With a big GPU (an RTX
+5090 holds all of the Coder's experts, most of Q2_0's) it runs at nearly the usual speed. With a small one, most
+experts come from the SSD and it is much slower (setup says so). `START-HERE.bat --setup --low-ram on|off` overrides
+the choice.
+
+**Low-RAM mode, resident (engine 0.1.30):** when the experts the GPU does not hold fit the RAM (with the same ~10 GB
+beside them), setup picks the resident variant instead (`--resident-experts`): at start the engine copies exactly those
+experts from `experts.bin` into RAM (page-locked when the driver allows, else locked in RAM), so while it answers
+nothing is read from the SSD, however little RAM the OS leaves for its file cache. Examples with setup's context: a
+32 GB PC with a 24 GB GPU runs Q2_0, IQ2_XS and the Coder this way (~16-18 GB of experts in RAM, the GPU holds the
+other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC stays mapped. The details:
+- The prompt path borrows room in the GPU's expert cache for its buffers and puts those experts back after the prompt;
+  as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
+- The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
+  RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
+- `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
+  (copy back, copy in, move into RAM) instead of one window waiting for the whole round. With `--batch` slots it
+  advances between their windows too (docs/BATCHING.md); not with `--batch-groups` or `--peer-device` (the blocking
+  tier runs there). With `--pipeline-windows 2` (two windows in flight, see
+  [MULTI_GPU.md](MULTI_GPU.md)) the copies into the evicted slots and the moves into RAM also wait until the windows
+  that were in flight when they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier
+  there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
+  rounds differently from the CPU) depends on when its copy lands.
+  It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked; the stats line
+  reports ms per round.
+- `STRATA_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted
+  blob into the RAM copy (equal-size blobs, fully page-locked copy). Same tokens, fewer host copies; it works with
+  `--adapt-async 1` too. Details and the measurement: [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md).
+- The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
+  copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
+  (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+- The engine leaves 4 GB of the RAM it finds free (`STRATA_RESIDENT_HEADROOM_GIB`); when even the experts the GPU does
+  not hold do not fit, it says so and runs the plain mapped mode. The server log shows, per request, how many expert
+  reads went to the file (`resident RAM: ... blob reads from the file`: 0 in steady use).
+- `--low-ram resident|mmap` forces one variant (also on a PC with enough RAM, e.g. to try it).
+- Several GPUs (#364, #384): setup recommends one GPU in the low-RAM mode (the resident variant has no layer split
+  yet), and asks; `--gpus 0,1` (or answering 2) shares the model across them with the mapped variant
+  (`--mmap-experts`): the cards together hold more of the experts, and two users measured it 1.3-1.6x faster than
+  one card, but the OS file cache can fill the RAM to 0 free during long prompts. `--yes` keeps one GPU. A config
+  with `--resident-experts` started with `--gpus` switches to `--mmap-experts` with a note, and the engine runs that
+  pair as `--mmap-experts` with a warning instead of refusing it. **Since 0.1.40 (#642, #848)** setup requires an
+  engine that runs the resident variant on a split, so it keeps both cards, resident, as for any config:
+  [MULTI_GPU.md](MULTI_GPU.md#using-it).
+
+**A mapped arena for small RAM (Linux, opt-in, 0.1.39, PR #640):** `STRATA_ARENA_MMAP=1` maps a native pack's expert
+arena read-only from the pack's `experts.bin` instead of reading it into locked RAM, for a PC whose GPUs hold most
+experts but whose RAM is small (2x 16 GB GPUs with 32 GB of RAM: ~1 GB -> 25 GB available while serving). The first
+start writes `experts.bin` (when the drive has room for it), later starts map it; the pages of the experts a GPU holds
+are handed back to the OS. Run it with `--pcie-frac 0` (the GPUs get no mapped alias). Without the variable nothing
+changes.
+
+**Releasing mapped expert pages on Windows (opt-in):** `STRATA_FILE_RELEASE=1` lets `FileExpertSource` trim the
+full file-backed pages of experts after their GPU uploads complete, including the slots lent to prefill and then
+refilled. It works with `experts.bin` and the direct GGUF views; shared boundary pages and private/pinned buffers
+are left alone. Unset or `0` keeps the previous behavior. On one 32 GB Windows 11 laptop with an RTX 4080 Laptop
+and a Thunderbolt RTX 3090, IQ2_XS with `--mmap-experts --layer-split 12 --trim-stage-weights` raised median available
+RAM from 0.51 to 12.19 GiB across 1K/4K/16K prompt trials, with 3.7-4.4% lower prefill throughput. It did not reduce
+committed memory or physical SSD reads. This is a working-set hint, not an unmap or a guarantee that the OS drops
+its file cache. See the [configuration, measurements and limits](../bench/results/2026-10-04-windows-mapped-release/README.md).
+
+**Low-RAM mode without `experts.bin` (engine 0.1.31):** for the native packs (IQ2_XS, IQ3_XXS, IQ3_S, the Coder, Swift,
+Q2_0 packed by `tools/iq_pack.py`; not the canonical Q2_0 pack setup makes for AVX-512 CPUs) the mapped mode no longer
+needs the pack's `experts.bin`: when the pack has none, the engine
+maps the model's GGUF files themselves and reads each expert's gate, up and down rows from where `native_experts.txt`
+says they are (the files are checked against it first: every tensor's name, type, shape, offset and bounds). That
+saves the 23-50 GB copy on the disk. The answers are the same: on the Coder, 64 greedy tokens from `experts.bin` and
+from the GGUF gave identical tokens and logits. An expert read from the GGUF is three reads instead of one, so the
+engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
+(Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
+
+**Linux file-tier I/O path (opt in, `STRATA_IO_PREFETCH=1`; 0.1.40.2):** the mapped file tier reads experts through
+page faults. With this on, the layer's uncached experts and the router-predicted ones of the next layer (`STRATA_LOOKAHEAD_K`,
+`STRATA_IO_PREFETCH_DEPTH`, default 2 when on) are read by I/O threads (`STRATA_IO_PF_THREADS`, default 8) with whole-blob
+`pread`s into the page cache, and the CPU kernels read the mapping as before. The bytes are the same, so the output is the
+same (greedy IQ3_XXS and Q2_0 hashes identical, prefetch off vs on). `STRATA_IO_PF_STAGE=1` instead stages every uncached
+expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` keeps only the demand reads. The per-request
+log line "file tier I/O" shows what the OS read from the drive (/proc/self/io, major faults) against the engine's expert
+reads; `STRATA_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
+Measured (interleaved A/B, 10 pairs, 200-token greedy medians, page cache dropped before each run, memory limit by cgroup):
+
+| box, lane | default (fill) | `STRATA_IO_PF_STAGE=1` |
+|---|---|---|
+| RTX 3060, 32 GB, IQ3_XXS | -3.4% | **+25.7%** |
+| RTX 3060, 16 GB, IQ3_XXS | -1.8% | -32.6% |
+| Radeon 780M iGPU, 16 GB, Q2_0 (adaptive tier off) | -0.7% (story +3.8%, code +4.1%) | -19% |
+
+With the experts warm in the page cache (46 GB on the 3060, 60 GB on the iGPU box) the file tier already runs at the
+resident speed, so there is nothing to win; the gap is the cold start and the low-RAM lanes. So it is off by default, and
+the staging variant is worth trying only on a 32 GB-class box. **iGPU caveat:** on a Radeon 780M, prefetch together with the
+adaptive tier (`--adapt-every`, on by default) under memory pressure reset the GPU in about 7 of 9 runs (the engine
+prints a warning and runs as asked); with `--adapt-every 100000` there were no resets in ~40 runs. The cause is not found.
+
+**A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
+fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
+start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files.
+It implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows, available commit capacity also
+limits the budget; a larger N is clamped to the smaller limit less 4 GiB and a 256 MiB margin, with a message.
+A clamped budget no longer fails the safety check that follows (#403). A budget that cannot be kept at all is a
+warning, with every expert read from the files. Setup sets N with `--resident-budget-gib N`. With
+the GGUF read in place it also warms the next layer's likely experts: while the CPU works on a layer, a thread applies
+the next layer's router to this layer's input and asks the OS for the pages of the predicted experts that neither the
+GPU nor the RAM budget holds (only pages - the experts computed are the same; `STRATA_LOOKAHEAD=0` turns it off). This
+is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
+RTX 5070, against ~3 tokens/s before these changes.
+
+**Switches added in 0.1.40 (all off unless noted; none changes the default output):**
+- `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
+  reach, and the expert cache holds the rest, giving slots back as the context grows. It needs one GPU, an expert
+  profile, the whole K/V in VRAM (no KV streaming) and every expert in RAM (not the resident low-RAM mode); otherwise,
+  and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
+- `--host-core last` (or `STRATA_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
+  workers take the first. Windows sends a GPU's interrupts to the first core, where a host spinning on the GPU's flags
+  waits for them (`--host-core first` is the default; the startup log names the cores).
+- `STRATA_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
+  as 0.1.39). `STRATA_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
+  short last one (changes the rounding). `STRATA_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
+  own buffers by their real allocation instead of 0.1.39's rule.
+- `STRATA_Q2_BITPLANE=1`: a bit-plane row kernel for Q2_0 on CPUs with AVX2 and no AVX-512 (changes the last bits).
+  `STRATA_NO_AVXVNNI=1` turns the AVX-VNNI forms of the i-quant, IQ4_NL and Q2_0 rows off on CPUs that have them
+  (Alder Lake, Sapphire Rapids and later); they give the same bits as the AVX2 forms, 4-25% faster rows.
+- Draft layer: `--lookup-chain-min M` (the shortest context match `--lookup-chain` extends, default 3),
+  `--mtp-hnorm stream` (one norm per stream, as llama.cpp's MTP graph) and `--mtp-draft-vocab FILE` (a token subset
+  of your own instead of `<mtp>/draft_vocab.bin`).
+- Elsewhere: HIP `STRATA_DENSE_MMQ=1` and `STRATA_HIP_ADAPT_KERNEL_COPY=1` in [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration);
+  `STRATA_KEEP_EMPTY_TURNS=1` and `STRATA_TOPK_STREAM=0` in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+
+**Read-ahead at start (Linux):** the weights, the native dense matrices, the GPU cache's fill from the profile, the
+resident RAM copy and the MTP draft files are asked for ahead of their reads (madvise / posix_fadvise WILLNEED in
+128 KiB steps), so the drive sees a deep queue instead of one page fault at a time. Measured on a Gen3 NVMe (RTX 5090,
+32 GB, Q2_0 resident at 262K): ready in 70 s instead of ~920 s; the fill went from 39 MB/s to 3.2 GB/s.
+`STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many fill pairs are asked for ahead (default 256).
+
+**How much came from where:** with `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the
+RAM copy, blobs and MB from the files, the time spent reading them; `routing prefetch`: how many of the file reads had
+been warmed). The server log has the same per request (`expert tiers: GPU ... hits ...; RAM ... blobs, files ...
+blobs ... MB read`), and `GET /metrics` lists `ram_blobs`, `file_blobs` and `file_mb` for each recent request (with
+engine 0.1.31 or newer). It also lists each request's speculative drafts, `drafts_offered` and `drafts_accepted`
+(`null` when the engine did not report them), and their sums since the server started in `totals` (#457).
+Its `hit_rate` is the VRAM share of the experts looked up while answering: experts the GPU reads over PCIe
+(`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower. `pcie_share`
+(engine 0.1.39 or newer, #588) is their share of all routed experts, and the server log and the Monitor tab show it
+beside the hit rate.
+
+**Where a decode window's time goes (profiling, #610):** start the server with `STRATA_DECODE_TIMING=1` (and
+`STRATA_VERIFY_PROFILE=1` for the GPU's side) in the environment. After each request the engine log then has one
+`strata decode timing:` line - windows, tokens per window, and per window the verify time split into the wait for the
+GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft - and one
+`strata decode GPU stages (ms/window):` line with the GPU time of each stage (GDN and QSA layers, the VRAM expert
+hits, the router, the head, ...). The GPU profile times every stage with events, so it slows the decode a little:
+use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of
+per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
+
+**How good the next-layer expert prediction is (measurement only):** `STRATA_LOOKAHEAD_STATS=1` runs the router look-ahead on any expert tier and
+scores it against the routing of the next layer: every 100 windows the engine log has a `strata lookahead stats:` line with the experts per layer
+outside the GPU cache, the recall and precision of the top-k / k+4 / k+10 guesses and of the vote-ranked top 4 / 8 / 12, how much of the PCIe share they
+would cover, and the predictor thread's time per window. It costs CPU (the predictor is a thread beside the expert pool), so use it to measure, not to
+time. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the adaptive tier's swap policy offline.
+
+Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
+and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
+
+**Faster prompts (engine 0.1.13):** the prompt is read in chunks of up to 8,192 tokens instead of 2,048 (`--prefill
+auto`: the largest chunk whose buffers fit in the expert-cache slots it borrows, and a request borrows only what its
+prompt needs); the experts are multiplied by llama.cpp's quantized MMQ kernels instead of being expanded to FP16
+first; the next layer's experts stream over PCIe while the current layer's attention runs; the PLE block runs for the
+whole chunk at once; unpinned experts are copied by helper threads. Measured on the RTX 5070 12 GB, 64 GB RAM,
+32K-token prompt: Q2_0 572 -> 1,290 tokens/s, IQ3_S 383 -> 1,208. Through the server (Q2_0, 128K context): 999 tokens
+353 -> 438 tokens/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed is unchanged. Needles 5/5
+(1K-262K). Details and the quality check:
+[`bench/results/2026-09-28-prefill-speed`](../bench/results/2026-09-28-prefill-speed/README.md). Existing installs
+switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
+[`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
+
+## Other GPUs (estimated)
+
+Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
+part by how many more experts the card's VRAM holds. Treat as **±20%**. Numbers are *prompt / output* tokens/s.
+The prompt figures predate engine 0.1.13, which about doubled prompt speed on the measured card; how much of that a
+card gains depends on its PCIe link (the experts stream over it), so they are still the older estimates.
+
+| GPU | Model | 1K | 4K | 32K | 64K | 128K | 262K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX 5060 Ti 16GB | Q2_0 | ~341 / ~80 | ~472 / ~87 | ~501 / ~81 | ~492 / ~72 | ~476 / ~62 | ~435 / ~53 |
+|  | IQ2_XS | ~291 / ~80 | ~406 / ~77 | ~434 / ~63 | ~426 / ~62 | ~413 / ~51 | ~383 / ~47 |
+|  | IQ3_XXS | ~249 / ~66 | ~359 / ~65 | ~381 / ~56 | ~374 / ~54 | ~363 / ~45 | - |
+| RTX 3090 24GB | Q2_0 | ~355 / ~128 | ~491 / ~140 | ~521 / ~130 | ~512 / ~115 | ~495 / ~100 | ~453 / ~85 |
+|  | IQ2_XS | ~303 / ~131 | ~422 / ~128 | ~451 / ~103 | ~444 / ~102 | ~430 / ~85 | ~398 / ~78 |
+|  | IQ3_XXS | ~260 / ~106 | ~374 / ~103 | ~396 / ~89 | ~390 / ~85 | ~378 / ~71 | - |
+
+More VRAM matters more than a faster GPU: every extra GB holds ~700 more experts, and every expert on the GPU is one the
+CPU does not have to compute. A 3090's 24 GB takes most of the CPU work away. (Since 0.1.14 the expert profile ranks
+all 24,576 experts; before, the cache stopped at 8,000, about 10-14 GB. `tools/make_profile.py` builds a profile from
+your own prompts: run the engine once with `--dump-routing trace.bin`, see the tool's help. The shipped profile already
+ranks every pair, so a trace only changes the order with `--reorder` (0.1.39, #587): your trace's pairs first, then the
+base's, then the rest.)
+
 ## Which model?
 
 [MODELS.md](MODELS.md) is the page for choosing a model: sizes, memory, providers and what fits. The families are
