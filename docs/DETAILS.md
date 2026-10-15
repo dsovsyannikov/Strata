@@ -206,6 +206,19 @@ deferred-GDN-write idea (skip the commit replay on fully accepted windows - the 
 already have): 60-85% of windows do fully accept, but the whole commit graph costs only 0.07-0.36 ms of a 25-30 ms
 window, so skipping it cannot buy more than ~0.3% - measured and dropped, not worth a pending-input ring.
 
+**Deep verify windows measured and rejected (`--spec 8`, fork):** the theory (Leviathan/Chen with a +8-15% marginal
+row cost) puts the throughput peak at depth 5-6 whenever per-step acceptance holds above ~0.6 - and ours does: on code
+the MTP head accepts 93/87/91% at depths 1-3 and still **76-81% at depths 4-5** (no FastMTP-style cliff; the shipped
+head is simply good). Yet `--spec 8` measured **8-9% SLOWER** than `--spec 4` (interleaved A/B, two rounds, code and
+Russian, min_p 0.5 self-limiting): from the offered/accepted counts, the window grows 3.5 -> 5.8 rows on average and
+costs 34 -> 48 ms, i.e. the marginal row costs **~58% of a decode step** on this single-GPU MoE window (each row's
+fresh experts and per-row work), not the 8-15% of batched serving stacks where rows share tensor-core batches.
+`STRATA_SPEC_ADAPT=1` defends correctly: it pulls spec 8 back to parity (-4% instead of -8%, spending a few probe
+rounds on 6-7). One wart visible in the histograms: the policy is process-wide, so a code request's "deep pays" EMAs
+can leak into a following low-acceptance request (a Russian leg spent 81 rounds at cap 7); a per-request decay would
+fix that if mixed traffic ever matters. Verdict: `--spec 4` + min_p is already near-optimal for this machine; deep
+windows only pay on hardware where extra verify rows are nearly free.
+
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
 token (106,299 ids), so answers in those languages are 15-38% faster (Q2_0, RTX 5070). Its head takes ~180 MiB of
