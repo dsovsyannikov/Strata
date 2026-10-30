@@ -72,7 +72,6 @@ void gdn_recurrence(void* state, const float* h, const float* gate, const float*
 /// chunked WMMA recurrence instead (gfx11, STRATA_GDN_CHUNKED=1, 64 tokens and more: other bits, see docs/AMD_HIP.md).
 /// SYCL only: 6 = the Xe sub-group recurrence (16-lane sub-groups, one barrier per token) + the norm kernel, the same
 /// bits as 0 on an Arc A770; gdn_recurrence takes it by default on Alchemist (STRATA_GDN_XE=0 off, =1 any Intel GPU).
-void gdn_recurrence_variant(int variant, void* state, const float* h, const float* gate, const float* beta,
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.
 void gdn_recurrence_variant(int variant, void* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,

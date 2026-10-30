@@ -250,7 +250,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     codes[2 * j] = lut[wb[j] & 0x0F];
                     codes[2 * j + 1] = lut[wb[j] >> 4];
                 }
-                int8_t* dst = kv == 0 ? &S.k[c][g * NF4_GROUP] : &S.v[c][g * NF4_GROUP];
+                int8_t* dst = kv == 0 ? &S.kv.k[c][g * NF4_GROUP] : &S.kv.v[c][g * NF4_GROUP];
 #pragma unroll
                 for (int j = 0; j < 16; ++j) dst[j] = codes[j];
                 (kv == 0 ? S.ks : S.vs)[c][g] = d;

@@ -45,7 +45,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 /// Batch windows: up to 8 slot groups in one launch - group i is rows [first[i], first[i] + ntok[i]) of the
 /// window's buffers, recurring over its own slot's state[i] (and committing keep[i] tokens when keep is given).
 struct GdnGroups {
-    float* state[8] = {};
+    void* state[8] = {};
     const int32_t* keep[8] = {};
     int first[8] = {};
     int ntok[8] = {};
@@ -56,7 +56,6 @@ struct GdnGroups {
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
                           void* stream);
-void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
 void gdn_step_norm_multi(void* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);

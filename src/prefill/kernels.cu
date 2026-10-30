@@ -494,7 +494,7 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(ST* __restrict__ state,
     ST* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
     const size_t rs = (size_t) HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = gdn_st_get(base[r * rs]);
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * rs]);
     const float g_col = gamma[col];
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
@@ -534,7 +534,7 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(ST* __restrict__ state,
         }
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) gdn_st_put(base[r * rs], s[r]);
+    for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * rs], s[r]);
 }
 
 // D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
@@ -555,7 +555,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(ST* __restrict__ 
     ST* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
     const size_t rs = (size_t) HV * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = gdn_st_get(base[r * rs]);
+    for (int r = 0; r < RPG; ++r) s[r] = strata::kernels::gdn_st_get(base[r * rs]);
     for (int64_t t = 0; t < T; ++t) {
         const float* ht = h + t * C;
         __syncthreads();
@@ -581,7 +581,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(ST* __restrict__ 
         if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) gdn_st_put(base[r * rs], s[r]);
+    for (int r = 0; r < RPG; ++r) strata::kernels::gdn_st_put(base[r * rs], s[r]);
 }
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
 // computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.

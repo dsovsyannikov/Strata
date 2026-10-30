@@ -1626,7 +1626,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
                         SessionState& sx = slot_ss(first);
-                        gg.state[gg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
+                        gg.state[gg.n] = (uint8_t*) sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_bytes;
                         gg.first[gg.n] = first;
                         gg.ntok[gg.n] = t - first;
                         ++gg.n;
@@ -2785,8 +2785,8 @@ bool Verifier::capture_commit(std::string& err) {
             if (!norms_ok) ok = false;
             else if (n_gdn > 0)
                 gdn_batched = gdn_commit_layers(
-                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
-                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    (float*) ((uint8_t*) ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_bytes),
+                    (int64_t) (gdn_bytes / 4), (int64_t) (gdn_rec / 4), qkv_L_ + (size_t) gdn_index * MT * C,
                     MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
                     beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
                     (int) n_gdn, commit_, cs_);
@@ -4003,12 +4003,15 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                     const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                     if (!wnm) { ok = false; break; }
                     for (int t = 0; t < S;) {
-                        const int first = t;
+                        const uint64_t gdn_bytes = strata::kernels::gdn_state_layer_bytes(
+                            g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels, g.ssm_d_conv);
+                        const uint64_t gdn_rec = strata::kernels::gdn_state_rec_bytes(g.ssm_state_size, g.ssm_v_heads);
+                                                const int first = t;
                         while (t < S && rows[t] == rows[first]) ++t;
                         SessionState& sx = *slots_[(size_t) rows[first]];
                         const int32_t* keep = commitd_ + (size_t) rows[first] * CB;
-                        float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
-                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        void* state = (uint8_t*) sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_bytes;
+                        float* conv = (float*) ((uint8_t*) state + gdn_rec);
                         const int64_t row = gdn_index * R + hbase + first;
                         gdn_conv_commit(conv, dc_qkv_ + (size_t) row * C, (int) C, keep, cs_);
                         // z only feeds the norm's output, which the commit discards (y_dummy_): the window scratch will do

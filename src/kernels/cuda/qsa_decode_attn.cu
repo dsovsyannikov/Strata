@@ -978,16 +978,6 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
 // kernel where it is built (the parity harness: never the environment).
 void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                          int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, cudaStream_t st, int kernel) {
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
     const int kv_mode = attn_kv_mode(pools);   // 4 = --kv nvfp4 (k_nf4 pools)
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
@@ -1019,6 +1009,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
         if (kv_mode == 4) STRATA_ATTN_LC(4);
+        if (kv_mode == 3) STRATA_ATTN_LC(3);
         else if (kv_mode == 2) STRATA_ATTN_LC(2);
         else if (kv_mode == 1) STRATA_ATTN_LC(1);
         else STRATA_ATTN_LC(0);
@@ -1059,8 +1050,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 4)
-        STRATA_ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        STRATA_ATTN_CHUNK_SEL(4, pre)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
+                                                                (int) s.page_size, scale, part_acc, part_m, part_l,
+                                                                n_chunks, (int) cap, stride);
     else
 #endif
     if (kv_mode == 3)
@@ -1081,7 +1073,6 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                                                 n_chunks, (int) cap, stride);
 }
 
-// qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
 void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
                         int64_t n_q, int v2, cudaStream_t st) {
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);

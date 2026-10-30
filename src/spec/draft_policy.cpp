@@ -320,7 +320,7 @@ int DraftPolicy::best_depth(int t_max) {
     // as choose(): a size whose cost is only guessed is measured, not vetoed - and only the cap can feed the
     // sizes above the incumbent, because min_p already shrinks windows below it on its own
     for (int t = t_max; t > incumbent_; --t)
-        if (cost_n_[t] < kProbes) { incumbent_ = t; return t; }
+        if (cost_n_[bk_][t] < kProbes) { incumbent_ = t; return t; }
     const double r_inc = mtp_tokens(incumbent_) / cost_ms(incumbent_);
     int best = incumbent_;
     double r_best = r_inc;

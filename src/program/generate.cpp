@@ -982,10 +982,8 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: budget for parked conversations, in host RAM (the default
-"
-                 "                       storage) or on disk (default: sized from the free RAM, up to 8192; 0 = off)
-"
+                 "  --conversation-cache-mib N  --serve: budget for parked conversations, in host RAM (the default\n"
+                 "                       storage) or on disk (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-storage S  --serve: ram (default) or disk - where parked snapshots live.\n"
                  "                       disk writes session-format files under --conversation-cache-dir and frees the\n"
@@ -10423,7 +10421,7 @@ int main(int argc, char** argv) {
                 o.conversation_cache_mib = 0;
             }
         }
-        strata::core::ConversationCache conversations(
+        strata::core::ConversationStore conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens,
             o.conversation_cache_storage, o.conversation_cache_dir);
@@ -12304,8 +12302,7 @@ int main(int argc, char** argv) {
                         "conversation_cache_storage=%s conversation_cache_min_free_mib=%lld "
                         "conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "
-",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -14301,8 +14298,7 @@ int main(int argc, char** argv) {
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow) {
                 if (auto back = conversations.take(parked.index)) incoming.emplace(std::move(*back));
                 else if (conversations.disk())
-                    std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s)
-",
+                    std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s) \n",
                                  conversations.last_error().c_str());
             }
             if (incoming || borrow) slot_source = -1;
@@ -14430,7 +14426,7 @@ int main(int argc, char** argv) {
                                          "this request starts with; taking it instead of borrowing\n");
                     borrow = false;
                     if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
-                        incoming.emplace(conversations.take(at));
+                        if (auto back = conversations.take(at)) incoming.emplace(std::move(*back));
                     if (!park_current(incoming ? incoming->bytes() : 0)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -18296,7 +18292,8 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        const int S_mtp_cap = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        int S_mtp = S_mtp_cap;   // STRATA_SPEC_ADAPT=1 narrows this per round (policy.best_depth)
 #if defined(STRATA_HAVE_DFLASH2)
         const bool spec_uses_df2 = use_df2;
 #else
@@ -18329,8 +18326,6 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const int S_mtp_cap = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
-        int S_mtp = S_mtp_cap;   // STRATA_SPEC_ADAPT=1 narrows this per round (policy.best_depth)
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         // as the serve loop's flag: the policy narrows the MTP cap to the best paid depth; output unchanged
         static const bool spec_adapt = [] {
