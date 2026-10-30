@@ -3933,8 +3933,6 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
     const int64_t R = dc_rows_, CB = 2 + MT, nQ = g.n_qsa_layers();
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     const bool ple = ss_->ple.ready() && ple_stage();

@@ -1009,7 +1009,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
 #define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
         if (kv_mode == 4) STRATA_ATTN_LC(4);
-        if (kv_mode == 3) STRATA_ATTN_LC(3);
+        else if (kv_mode == 3) STRATA_ATTN_LC(3);
         else if (kv_mode == 2) STRATA_ATTN_LC(2);
         else if (kv_mode == 1) STRATA_ATTN_LC(1);
         else STRATA_ATTN_LC(0);
@@ -1112,6 +1112,8 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         std::exit(1);
     }
     const int kv_mode = attn_kv_mode(pools.p[0]);
+    if (kv_mode == 4) return false;   // nf4 pools: the multi-slot chains below are modes 0-3 only;
+                                   // the caller falls back to the per-query (mode-4-correct) batch call
     for (int64_t z = 0; z < n_q; ++z) {
         if (!pools.p[z].page_table) {
             std::fprintf(stderr, "qsa_decode_attn_slots: missing page table\n");
@@ -1170,10 +1172,18 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
         std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
+    const int kv_mode = attn_kv_mode(pools);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);   // nf4 rows need it first
+    const bool nf4_rows = pools.k_nf4 != nullptr;   // the rows kernel is modes 0-3; nf4 rows go one launch each
+    if (nf4_rows) {
+        // per-row through the mode-4-correct batch call, like the lane-cell/pre75 rows below
+        for (int64_t z = 0; z < n_q; ++z)
+            qsa_decode_attn_batch(q + (size_t) z * s.n_head * HD, rows.p[(size_t) z], ids + (size_t) z * cap,
+                                  steps + (size_t) z * kStepCount, cap, s, scratch + (size_t) z * stride, attn,
+                                  1, stream);
+        return;
+    }
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;

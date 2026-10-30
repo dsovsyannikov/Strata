@@ -6172,6 +6172,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
+    const uint64_t gdn_bytes = strata::kernels::gdn_state_layer_bytes(
+        g.ssm_state_size, g.ssm_v_heads, g.ssm_conv_channels, g.ssm_d_conv);
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const cudaStream_t cs = (cudaStream_t) m.cs;
@@ -6818,8 +6820,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                               *wsa = need(v, "ssm_a", err);
                         if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                         pt.mark(kPfGdn, cs);
-                        float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        void* state = (uint8_t*) ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_bytes;
+                        float* conv = (float*) ((uint8_t*) state +
+                                                strata::kernels::gdn_state_rec_bytes(g.ssm_state_size, g.ssm_v_heads));
                         if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                         if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                         if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;

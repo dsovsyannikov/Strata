@@ -14298,7 +14298,7 @@ int main(int argc, char** argv) {
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow) {
                 if (auto back = conversations.take(parked.index)) incoming.emplace(std::move(*back));
                 else if (conversations.disk())
-                    std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s) \n",
+                    std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s)\n",
                                  conversations.last_error().c_str());
             }
             if (incoming || borrow) slot_source = -1;
