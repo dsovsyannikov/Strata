@@ -1918,3 +1918,7 @@ Also from PR #3779, measured by its author on the same CMP 170HX; none of the fi
 | `STRATA_PF_FUSED_WS=1` | Warp-specialized kernel with the same F16 products; needs about 101 KB of shared memory, so sm_80 and sm_90 only (it says "not available" elsewhere). | 7.65 ms for the same layer |
 | `STRATA_GDN_TC=1` | The DeltaNet recurrence of a prompt as a chunked scan on the tensor cores; needs 122 KB of shared memory a block (sm_80, sm_90). | recurrence 105 -> 34 ms at 3.3K tokens; prompts +3.9 % (4K), +6.0 % (16K), +6.7 % (52K) |
 | `STRATA_PLE_COMPACT=1`, `STRATA_PLE_COPY_STREAM=1`, `STRATA_EMBED_VRAM=1`, `STRATA_DEQUANT_SIDE=1` | The PLE rows go up raw and are dequantized on the card, on their own stream; the token-embedding table in VRAM; the dense dequant on a side stream (CUDA only). All bitwise. | prompts +2.2 % to +2.6 % for the four together |
+
+### --gdn-f16 breaks the SERVE prompt read after the v0.2.8 rebase (open, fork)
+
+With `--gdn-f16` the serve chunked prompt read writes fp16 NaN into GDN layers >= 1 (layer 0 stays valid; inputs verified finite at layer 1). One-shot generate is clean; all parity suites pass. Not KV/format/context dependent. Until fixed: no `--gdn-f16` under `--serve`.
