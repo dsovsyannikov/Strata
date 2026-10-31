@@ -81,17 +81,16 @@ __device__ __forceinline__ void load8_nf4(const QsaAttnPools& p, bool value, lon
     constexpr int bytes_per_head = (int) sizeof(block_nf4);   // one head-cell row IS one 144 B block
     const block_nf4* blk = reinterpret_cast<const block_nf4*>((value ? p.v_nf4 : p.k_nf4) + row * bytes_per_head);
     const int g = d0 / NF4_GROUP;
-    const int i = d0 % NF4_GROUP;              // 0 or 8: the low or the high nibble of the group's 8 bytes
+    const int i = d0 % NF4_GROUP;              // 0 or 8: the group's first or second 8-element half
     const float sc = nf4_e4m3_decode(blk->sc[g]);
-    const uint8_t* qs = blk->qs + g * (NF4_GROUP / 2);   // both halves live in these same 8 bytes
-    if (i == 0) {
+    const uint8_t* qs = blk->qs + g * (NF4_GROUP / 2) + (i >> 1);   // element d: byte d/2, nibble d%2
 #pragma unroll
-        for (int k = 0; k < 8; ++k) out[k] = nf4_e2m1_decode(qs[k] & 0x0F) * sc;
-    } else {
-#pragma unroll
-        for (int k = 0; k < 8; ++k) out[k] = nf4_e2m1_decode(qs[k] >> 4) * sc;
+    for (int k = 0; k < 4; ++k) {
+        out[2 * k] = nf4_e2m1_decode(qs[k] & 0x0F) * sc;
+        out[2 * k + 1] = nf4_e2m1_decode(qs[k] >> 4) * sc;
     }
 }
+
 template <int KV_MODE>
 __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     if constexpr (KV_MODE == 0) load8_f16(p, value, row, d0, out);
@@ -291,8 +290,8 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
             const int e = t % NF4_GROUP;
             const block_nf4* nblk = reinterpret_cast<const block_nf4*>(p.v_nf4 + srow[c] * nf4_bph);
             const float nd = nf4_e4m3_decode(nblk->sc[g]);
-            const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e & 7)];
-            v = nf4_e2m1_decode(e < 8 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
+            const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e >> 1)];
+            v = nf4_e2m1_decode((e & 1) == 0 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
             const int b = t / QK4_0;
@@ -559,8 +558,8 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
         const int e = d % NF4_GROUP;
         const block_nf4* nblk = reinterpret_cast<const block_nf4*>(p.v_nf4 + row * nf4_bph);
         const float nd = nf4_e4m3_decode(nblk->sc[g]);
-        const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e & 7)];
-        return nf4_e2m1_decode(e < 8 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
+        const uint8_t nbyte = nblk->qs[g * (NF4_GROUP / 2) + (e >> 1)];
+        return nf4_e2m1_decode((e & 1) == 0 ? (nbyte & 0x0F) : (nbyte >> 4)) * nd;
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -981,16 +980,6 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
 // kernel where it is built (the parity harness: never the environment).
 void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                          int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, cudaStream_t st, int kernel) {
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
     const int kv_mode = attn_kv_mode(pools);
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
@@ -1260,10 +1249,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                                           scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else
 #endif
-    if (kv_mode == 3)
-    else if (kv_mode == 4)
+    if (kv_mode == 4)
         STRATA_ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 2)

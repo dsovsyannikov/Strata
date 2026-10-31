@@ -54,7 +54,9 @@ endif()
 # makes the process's ANSI code page UTF-8 (Windows 10 1903 and newer; older Windows ignores it and nothing changes), so the
 # command line, fopen and std::ifstream all take UTF-8.
 function(strata_utf8_manifest target)
-  if(MSVC)
+  # a no-admin Windows toolchain without mt.exe (CMAKE_MT-NOTFOUND) cannot embed a manifest (LNK1158):
+  # STRATA_NO_UTF8_MANIFEST=ON opts out (the console then takes the system code page)
+  if(MSVC AND NOT STRATA_NO_UTF8_MANIFEST)
     target_sources(${target} PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/strata-utf8.manifest)
   endif()
 endfunction()

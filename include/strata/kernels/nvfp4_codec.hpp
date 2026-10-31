@@ -109,9 +109,12 @@ inline NF4_HD float nf4_div_rn(float a, float b) {
 #endif
 }
 
-/// One group of 16 floats -> its scale byte and 8 packed code bytes, in NInfer's exact order
+/// One group of 16 floats -> its scale byte and 8 packed code bytes.  The quantization order is NInfer's
 /// (src/ops/kv_cache/nvfp4_group16_codec.cuh): amax / 6 clamped to [2^-9, 448] before the E4M3 RNE encode,
 /// then every element DIVIDED by the decoded scale (not multiplied by a reciprocal) before its E2M1 RNE code.
+/// The nibble packing is the MMA one (byte m = elements 2m low, 2m+1 high), so the pool's code bytes load
+/// straight into mma.m16n8k64.mxf4nvf4 fragments; NInfer's own cache splits the pair (j, j+8) but its MMA
+/// path (pack_nvfp4_e2m1x16) packs adjacent pairs the same way this does.
 /// Host and device compile the same lines, so the parity test pins the kernels to these bits.
 inline NF4_HD void nf4_quantize_group16(const float* x, uint8_t& scale_out, uint8_t* qs8) {
     float amax = 0.0f;
@@ -137,9 +140,9 @@ inline NF4_HD void nf4_quantize_group16(const float* x, uint8_t& scale_out, uint
 #if defined(__CUDACC__)
 #pragma unroll
 #endif
-    for (int j = 0; j < 8; ++j)
-        qs8[j] = (uint8_t) (nf4_e2m1_encode(nf4_div_rn(x[j], s)) |
-                            (nf4_e2m1_encode(nf4_div_rn(x[j + 8], s)) << 4));
+    for (int m = 0; m < 8; ++m)
+        qs8[m] = (uint8_t) (nf4_e2m1_encode(nf4_div_rn(x[2 * m], s)) |
+                            (nf4_e2m1_encode(nf4_div_rn(x[2 * m + 1], s)) << 4));
 }
 
 /// One group's 16 floats back, exactly the decode side of the same file (E2M1 value * E4M3 scale - a product
@@ -149,9 +152,9 @@ inline NF4_HD void nf4_dequant_group16(const uint8_t* qs8, uint8_t scale, float*
 #if defined(__CUDACC__)
 #pragma unroll
 #endif
-    for (int j = 0; j < 8; ++j) {
-        out16[j] = nf4_e2m1_decode(qs8[j] & 0x0F) * s;
-        out16[j + 8] = nf4_e2m1_decode(qs8[j] >> 4) * s;
+    for (int m = 0; m < 8; ++m) {
+        out16[2 * m] = nf4_e2m1_decode(qs8[m] & 0x0F) * s;
+        out16[2 * m + 1] = nf4_e2m1_decode(qs8[m] >> 4) * s;
     }
 }
 
