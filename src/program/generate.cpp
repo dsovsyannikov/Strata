@@ -3733,6 +3733,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or nvfp4\n");
         return 2;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    // the NVFP4 kernels are CUDA-only (kv_nf4.cu): q4_0's own per-backend ports cover HIP/SYCL, this format
+    // does not (yet) - refuse cleanly rather than allocate pools no append can fill
+#else
+    if (o.kv == "nvfp4") {
+        std::fprintf(stderr, "strata generate: --kv nvfp4 needs the CUDA engine (kv_nf4.cu's kernels); "
+                             "this build serves the same rotation as --kv q4_0\n");
+        return 2;
+    }
+#endif
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
     strata::core::qsa_set_kv_nf4(o.kv == "nvfp4"); // NInfer's KV codec: E2M1 + E4M3 scale per 16 (kv_nf4.hpp)
