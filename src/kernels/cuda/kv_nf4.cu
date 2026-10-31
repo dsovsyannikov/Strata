@@ -47,9 +47,14 @@ __global__ void kv_append_nf4_kernel(uint8_t* __restrict__ k_nf4, uint8_t* __res
 #pragma unroll
     for (int i = 0; i < NF4_GROUP; ++i) x[i] = src[i];
     const long long page = (long long) table[pos / page_size];
-    const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, row, g, x);
-    if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, row, g, x);
+    // the pool row is the SLOT row (page * heads: the ring tables map a page to a slot, and only the
+    // identity table of a resident session makes the two coincide); the host copy keeps the LOGICAL row
+    // ((pos / page) * heads), which is what a session image serializes - q4_store's two-row contract
+    if (page >= 0)
+        nf4_group_store(is_v ? v_nf4 : k_nf4, (page * kv_heads + h) * page_size + (pos % page_size), g, x);
+    if (host.k_nf4 != nullptr)
+        nf4_group_store(is_v ? host.v_nf4 : host.k_nf4,
+                        ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), g, x);
 }
 
 // The prompt path: grid (T, kv_heads * 2); also into the staging pool (identity layout) when given.
@@ -66,10 +71,10 @@ __global__ void kv_append_nf4_batch_kernel(uint8_t* __restrict__ k_nf4, uint8_t*
 #pragma unroll
     for (int i = 0; i < NF4_GROUP; ++i) x[i] = src[i];
     const long long page = (long long) table[pos / page_size];
-    const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, row, g, x);
-    if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, row, g, x);
-    if (stage.k_nf4 != nullptr) nf4_group_store(is_v ? stage.v_nf4 : stage.k_nf4, row, g, x);
+    const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    if (page >= 0) nf4_group_store(is_v ? v_nf4 : k_nf4, (page * kv_heads + h) * page_size + (pos % page_size), g, x);
+    if (host.k_nf4 != nullptr) nf4_group_store(is_v ? host.v_nf4 : host.k_nf4, row_id, g, x);
+    if (stage.k_nf4 != nullptr) nf4_group_store(is_v ? stage.v_nf4 : stage.k_nf4, row_id, g, x);
 }
 
 // Gather step[kStepWidth] cells into FP16 scratch (the non-fused attention paths): one block per (id, head).
